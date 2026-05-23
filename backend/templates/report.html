@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>基金分析报告 - {{ fund_code }}</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; color: #1a1a2e; background: #f8fafc; padding: 40px; }
+.container { max-width: 800px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); padding: 40px; }
+h1 { font-size: 24px; margin-bottom: 8px; color: #1e3a5f; }
+.subtitle { color: #64748b; font-size: 14px; margin-bottom: 32px; }
+.section { margin-bottom: 28px; }
+.section h2 { font-size: 16px; color: #3b82f6; border-left: 3px solid #3b82f6; padding-left: 10px; margin-bottom: 16px; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.metric-card { background: #f1f5f9; border-radius: 8px; padding: 16px; text-align: center; }
+.metric-label { font-size: 12px; color: #64748b; margin-bottom: 4px; }
+.metric-value { font-size: 20px; font-weight: 700; }
+.positive { color: #16a34a; }
+.negative { color: #dc2626; }
+.chart-container { margin: 16px 0; }
+.info-table { width: 100%; border-collapse: collapse; }
+.info-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; }
+.info-table td:first-child { color: #64748b; width: 120px; }
+.footer { text-align: center; color: #94a3b8; font-size: 12px; margin-top: 32px; padding-top: 16px; border-top: 1px solid #e2e8f0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>基金分析报告</h1>
+  <p class="subtitle">{{ fund_code }} - {{ fund_name }} | 生成时间: {{ generated_at }}</p>
+
+  <div class="section">
+    <h2>核心指标</h2>
+    <div class="metrics">
+      <div class="metric-card">
+        <div class="metric-label">年化收益率</div>
+        <div class="metric-value {{ 'positive' if annualized_return[0] != '-' else 'negative' }}">{{ annualized_return }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">最大回撤</div>
+        <div class="metric-value negative">{{ max_drawdown }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">夏普比率</div>
+        <div class="metric-value">{{ sharpe_ratio }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">总收益率</div>
+        <div class="metric-value {{ 'positive' if total_return[0] != '-' else 'negative' }}">{{ total_return }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">年化波动率</div>
+        <div class="metric-value">{{ volatility }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">交易天数</div>
+        <div class="metric-value">{{ trading_days }}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>净值走势</h2>
+    <div class="chart-container">{{ chart_svg }}</div>
+  </div>
+
+  <div class="section">
+    <h2>基本信息</h2>
+    <table class="info-table">
+      <tr><td>基金代码</td><td>{{ fund_code }}</td></tr>
+      <tr><td>基金名称</td><td>{{ fund_name }}</td></tr>
+      <tr><td>数据区间</td><td>{{ start_date }} ~ {{ end_date }}</td></tr>
+      <tr><td>无风险利率</td><td>2.50%</td></tr>
+    </table>
+  </div>
+
+  <div class="footer">本报告由基金分析系统自动生成，仅供参考，不构成投资建议。</div>
+</div>
+</body>
+</html>
