@@ -1,7 +1,8 @@
 import os
 import base64
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader, Markup
+from jinja2 import Environment, FileSystemLoader
+from markupsafe import Markup
 from schemas import FundReportData
 
 

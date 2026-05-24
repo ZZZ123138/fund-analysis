@@ -36,3 +36,40 @@ class FundReportData(BaseModel):
 
 class ReportRequest(BaseModel):
     fund_code: str
+
+
+class PortfolioInit(BaseModel):
+    balance: float
+
+
+class PortfolioBuy(BaseModel):
+    fund_code: str
+    amount: float
+
+
+class PortfolioSell(BaseModel):
+    fund_code: str
+
+
+class CycleAnalysis(BaseModel):
+    rsi: float
+    percentile: float
+    ma_deviation: float
+    status: str  # "strong" | "weak" | "neutral"
+    annual_return: float
+    show_warning: bool
+    signals: list[str]
+
+
+class MacroClock(BaseModel):
+    stage: str
+    stage_cn: str
+    description: str
+    advice: str
+
+
+class FundTypeAnalysis(BaseModel):
+    fund_type: str
+    risk_level: str
+    description: str
+    characteristics: list[str]

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import GsapBackground from "@/components/GsapBackground";
 
 export const metadata: Metadata = {
   title: "基金分析系统",
@@ -13,7 +14,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body>
+        <GsapBackground />
+        {children}
+      </body>
     </html>
   );
 }
