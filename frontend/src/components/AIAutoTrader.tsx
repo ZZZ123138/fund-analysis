@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface AutoTradeConfig {
   enabled: boolean;
@@ -17,12 +17,6 @@ interface TradeSuggestion {
   reason: string;
   confidence: number;
 }
-
-const MOCK_SUGGESTIONS: TradeSuggestion[] = [
-  { fundCode: "000001", fundName: "华夏成长混合", action: "买入", amount: 5000, reason: "信号强度高，趋势向上，建议建仓", confidence: 85 },
-  { fundCode: "110011", fundName: "易方达中小盘混合", action: "观望", amount: 0, reason: "近期波动较大，建议等待回调", confidence: 60 },
-  { fundCode: "000961", fundName: "天弘沪深300ETF联接A", action: "买入", amount: 3000, reason: "指数基金适合定投，当前估值合理", confidence: 75 },
-];
 
 function getActionColor(action: string): string {
   if (action === "买入") return "var(--green)";
@@ -44,7 +38,31 @@ export default function AIAutoTrader({ onExecuteTrade }: { onExecuteTrade: (code
     strategy: "混合",
   });
 
-  const [suggestions] = useState<TradeSuggestion[]>(MOCK_SUGGESTIONS);
+  const [suggestions, setSuggestions] = useState<TradeSuggestion[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch("/api/ai-trading/suggestions")
+      .then(r => r.json())
+      .then(data => {
+        setSuggestions(data.suggestions || []);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const handleExecute = async (code: string, amount: number) => {
+    try {
+      const resp = await fetch("/api/portfolio/buy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fund_code: code, amount }),
+      });
+      if (resp.ok) {
+        onExecuteTrade(code, amount);
+      }
+    } catch {}
+  };
 
   return (
     <div>
@@ -103,7 +121,11 @@ export default function AIAutoTrader({ onExecuteTrade }: { onExecuteTrade: (code
       {/* 建议列表 */}
       <div className="trader-list-label">今日交易建议</div>
       <div className="trader-list">
-        {suggestions.map((s) => (
+        {loading ? (
+          <div style={{ padding: "12px", textAlign: "center", color: "var(--text-secondary)", fontSize: "var(--text-xs)" }}>加载中...</div>
+        ) : suggestions.length === 0 ? (
+          <div style={{ padding: "12px", textAlign: "center", color: "var(--text-secondary)", fontSize: "var(--text-xs)" }}>暂无交易信号</div>
+        ) : suggestions.map((s) => (
           <div key={s.fundCode} className="trader-suggestion">
             <div className="trader-suggestion-header">
               <div>
@@ -122,7 +144,7 @@ export default function AIAutoTrader({ onExecuteTrade }: { onExecuteTrade: (code
                 <span style={{ fontSize: "var(--text-xs)", fontWeight: 600, color: getConfidenceColor(s.confidence) }}>{s.confidence}%</span>
               </div>
               {s.action === "买入" && s.amount > 0 && (
-                <button className="btn btn-primary" style={{ padding: "4px 12px", fontSize: "var(--text-xs)" }} onClick={() => onExecuteTrade(s.fundCode, s.amount)} disabled={!config.enabled}>
+                <button className="btn btn-primary" style={{ padding: "4px 12px", fontSize: "var(--text-xs)" }} onClick={() => handleExecute(s.fundCode, s.amount)} disabled={!config.enabled}>
                   执行买入
                 </button>
               )}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface FundRecommendation {
   code: string;
@@ -12,15 +12,6 @@ interface FundRecommendation {
   expectedReturn: string;
   tags: string[];
 }
-
-const AI_PICKS: FundRecommendation[] = [
-  { code: "000001", name: "华夏成长混合", type: "混合型", reason: "长期业绩稳定，基金经理经验丰富，适合稳健型投资者", score: 92, risk: "中", expectedReturn: "年化8-12%", tags: ["稳健", "长期", "明星基金"] },
-  { code: "110011", name: "易方达中小盘混合", type: "混合型", reason: "聚焦中小盘成长股，历史收益优秀，适合追求高收益的投资者", score: 88, risk: "高", expectedReturn: "年化12-18%", tags: ["成长", "中小盘", "高收益"] },
-  { code: "000961", name: "天弘沪深300ETF联接A", type: "指数型", reason: "跟踪沪深300指数，费率低，适合长期定投", score: 85, risk: "中", expectedReturn: "年化6-10%", tags: ["指数", "定投", "低费率"] },
-  { code: "001632", name: "天弘创业板ETF联接A", type: "指数型", reason: "跟踪创业板指数，科技成长属性强", score: 82, risk: "高", expectedReturn: "年化10-15%", tags: ["科技", "成长", "创业板"] },
-  { code: "000478", name: "建信中债1-3年国开行债券指数A", type: "债券型", reason: "低风险债券基金，收益稳定，适合保守型投资者", score: 78, risk: "低", expectedReturn: "年化3-5%", tags: ["债券", "低风险", "稳健"] },
-  { code: "000831", name: "工银瑞信前沿医疗股票", type: "股票型", reason: "聚焦医疗健康行业，长期成长性好", score: 86, risk: "高", expectedReturn: "年化10-15%", tags: ["医疗", "健康", "行业主题"] },
-];
 
 function getScoreColor(score: number): string {
   if (score >= 90) return "var(--green)";
@@ -37,11 +28,23 @@ function getRiskColor(risk: string): string {
 
 export default function AIFundPicks({ onSelectFund }: { onSelectFund: (code: string) => void }) {
   const [selectedType, setSelectedType] = useState<string>("全部");
+  const [picks, setPicks] = useState<FundRecommendation[]>([]);
+  const [loading, setLoading] = useState(true);
   const types = ["全部", "混合型", "指数型", "债券型", "股票型"];
 
+  useEffect(() => {
+    fetch("/api/ai-trading/fund-picks")
+      .then(r => r.json())
+      .then(data => {
+        setPicks(data.picks || []);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
   const filteredPicks = selectedType === "全部"
-    ? AI_PICKS
-    : AI_PICKS.filter((pick) => pick.type === selectedType);
+    ? picks
+    : picks.filter((pick) => pick.type === selectedType);
 
   return (
     <div>
@@ -71,7 +74,11 @@ export default function AIFundPicks({ onSelectFund }: { onSelectFund: (code: str
 
       {/* 基金列表 */}
       <div className="picks-list">
-        {filteredPicks.map((fund) => (
+        {loading ? (
+          <div style={{ padding: "20px", textAlign: "center", color: "var(--text-secondary)", fontSize: "var(--text-xs)" }}>加载中...</div>
+        ) : filteredPicks.length === 0 ? (
+          <div style={{ padding: "20px", textAlign: "center", color: "var(--text-secondary)", fontSize: "var(--text-xs)" }}>暂无推荐数据</div>
+        ) : filteredPicks.map((fund) => (
           <div key={fund.code} className="picks-card" onClick={() => onSelectFund(fund.code)}>
             <div className="picks-card-header">
               <div>

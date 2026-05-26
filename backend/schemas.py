@@ -73,3 +73,18 @@ class FundTypeAnalysis(BaseModel):
     risk_level: str
     description: str
     characteristics: list[str]
+
+
+class WatchlistItem(BaseModel):
+    fund_code: str
+    fund_name: Optional[str] = None
+
+
+class WatchlistUpdate(BaseModel):
+    enabled: Optional[int] = None
+
+
+class NotificationSettings(BaseModel):
+    serverchan_key: Optional[str] = None
+    enabled: Optional[int] = None
+    check_interval_minutes: Optional[int] = None

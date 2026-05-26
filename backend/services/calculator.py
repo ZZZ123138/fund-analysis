@@ -238,6 +238,173 @@ def get_merrill_clock_stage(annualized_return: float, volatility: float) -> dict
     }
 
 
+def calculate_industry_score(prices: list[float]) -> dict:
+    """多因子行业评分：动量 + 均值回归 + 趋势 + 波动率。返回 0-100 综合分。"""
+    if len(prices) < 60:
+        return {"score": 50, "momentum": 0, "reversion": 50, "trend": 0, "volatility": 0}
+
+    # 1. 动量因子（20日涨幅 + 60日涨幅加权）
+    ret_20 = (prices[-1] - prices[-20]) / prices[-20] if len(prices) >= 20 and prices[-20] > 0 else 0
+    ret_60 = (prices[-1] - prices[-60]) / prices[-60] if len(prices) >= 60 and prices[-60] > 0 else 0
+    momentum_raw = ret_20 * 0.6 + ret_60 * 0.4
+    momentum_score = max(0, min(100, 50 + momentum_raw * 500))  # 归一化到 0-100
+
+    # 2. 均值回归因子（RSI + 百分位，越低分越高=买入机会）
+    rsi = calculate_rsi(prices)
+    percentile = calculate_percentile(prices)
+    reversion_score = (100 - rsi) * 0.5 + (100 - percentile) * 0.5
+
+    # 3. 趋势因子（乖离率方向）
+    ma_dev = calculate_ma_deviation(prices)
+    trend_score = max(0, min(100, 50 + ma_dev * 5))  # 乖离率 -10%~+10% 映射到 0-100
+
+    # 4. 波动率因子（低波动更好）
+    daily_returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices)) if prices[i-1] > 0]
+    vol = _std_sample(daily_returns[-60:]) * math.sqrt(252) if len(daily_returns) >= 60 else 0.2
+    vol_score = max(0, min(100, 100 - vol * 250))  # 波动率越低分越高
+
+    # 综合评分（权重可调）
+    score = (
+        momentum_score * 0.30 +   # 动量 30%
+        reversion_score * 0.30 +  # 均值回归 30%
+        trend_score * 0.20 +      # 趋势 20%
+        vol_score * 0.20          # 波动率 20%
+    )
+
+    return {
+        "score": round(score, 1),
+        "momentum": round(momentum_score, 1),
+        "reversion": round(reversion_score, 1),
+        "trend": round(trend_score, 1),
+        "volatility": round(vol_score, 1),
+        "ret_20d": round(ret_20 * 100, 2),
+        "ret_60d": round(ret_60 * 100, 2),
+    }
+
+
+def calculate_correlation(prices_a: list[float], prices_b: list[float], period: int = 60) -> float:
+    """计算两个价格序列的相关系数。"""
+    if len(prices_a) < period or len(prices_b) < period:
+        return 0.0
+    a = prices_a[-period:]
+    b = prices_b[-period:]
+    ret_a = [(a[i] - a[i-1]) / a[i-1] for i in range(1, len(a)) if a[i-1] > 0]
+    ret_b = [(b[i] - b[i-1]) / b[i-1] for i in range(1, len(b)) if b[i-1] > 0]
+    n = min(len(ret_a), len(ret_b))
+    if n < 10:
+        return 0.0
+    ret_a, ret_b = ret_a[:n], ret_b[:n]
+    mean_a = sum(ret_a) / n
+    mean_b = sum(ret_b) / n
+    cov = sum((ret_a[i] - mean_a) * (ret_b[i] - mean_b) for i in range(n)) / n
+    std_a = math.sqrt(sum((x - mean_a) ** 2 for x in ret_a) / n)
+    std_b = math.sqrt(sum((x - mean_b) ** 2 for x in ret_b) / n)
+    if std_a == 0 or std_b == 0:
+        return 0.0
+    return round(cov / (std_a * std_b), 3)
+
+
+def calculate_crowding_score(sector_fund_signals: list[dict]) -> float:
+    """拥挤度评分：同行业基金信号一致性越高越拥挤。返回 0-100。"""
+    if len(sector_fund_signals) < 2:
+        return 0.0
+    statuses = [s.get("status", "neutral") for s in sector_fund_signals]
+    # 计算信号一致性
+    most_common = max(set(statuses), key=statuses.count)
+    agreement = statuses.count(most_common) / len(statuses)
+    # RSI 集中度
+    rsis = [s.get("rsi", 50) for s in sector_fund_signals]
+    rsi_std = _std_sample(rsis)
+    # 一致性越高、RSI 越集中 = 越拥挤
+    crowding = agreement * 60 + max(0, (20 - rsi_std) / 20) * 40
+    return round(min(100, crowding), 1)
+
+
+def calculate_davis_score(
+    macro_score: float,
+    monetary_score: float,
+    industry_score: float,
+    fund_rsi: float,
+    fund_percentile: float,
+) -> dict:
+    """戴维斯四维评分系统。
+    输入各维度 0-100 分，输出总分 0-5 和操作建议。
+    """
+    # 宏观维度：正向 +1（用市场温度代理，>50 为正向）
+    d_macro = 1.0 if macro_score > 55 else (0.5 if macro_score > 40 else 0.0)
+
+    # 货币维度：宽松 +1（用风格差代理，成长跑赢价值=宽松）
+    d_monetary = 1.0 if monetary_score > 60 else (0.5 if monetary_score > 45 else 0.0)
+
+    # 行业维度：共振 +1（行业评分>65 且拥挤度不高）
+    d_industry = 1.0 if industry_score > 65 else (0.5 if industry_score > 50 else 0.0)
+
+    # 盈利增速代理：RSI 动量 > 55 且趋势向上视为盈利动能强
+    # （真实 EPS 增速需要持仓数据，暂用动量代理）
+    d_earnings = 1.0 if fund_rsi > 55 else (0.5 if fund_rsi > 45 else 0.0)
+
+    # PE 分位：<30% 低估 +1
+    d_valuation = 1.0 if fund_percentile < 30 else (0.5 if fund_percentile < 50 else 0.0)
+
+    total = d_macro + d_monetary + d_industry + d_earnings + d_valuation
+
+    if total >= 3.5:
+        action = "买入"
+    elif total >= 1.5:
+        action = "持有"
+    else:
+        action = "减仓"
+
+    return {
+        "total": round(total, 2),
+        "action": action,
+        "macro": d_macro,
+        "monetary": d_monetary,
+        "industry": d_industry,
+        "earnings": d_earnings,
+        "valuation": d_valuation,
+    }
+
+
+def calculate_style_preference(growth_prices: list[float], value_prices: list[float]) -> dict:
+    """计算成长/价值风格偏好（货币维度代理）。
+    成长跑赢价值 → 货币宽松/风险偏好高 → 偏成长。
+    """
+    if len(growth_prices) < 20 or len(value_prices) < 20:
+        return {"style": "neutral", "score": 50, "spread": 0}
+
+    # 20 日涨幅差
+    g_ret = (growth_prices[-1] - growth_prices[-20]) / growth_prices[-20]
+    v_ret = (value_prices[-1] - value_prices[-20]) / value_prices[-20]
+    spread = g_ret - v_ret
+
+    # 60 日涨幅差（如果有足够数据）
+    if len(growth_prices) >= 60 and len(value_prices) >= 60:
+        g_ret60 = (growth_prices[-1] - growth_prices[-60]) / growth_prices[-60]
+        v_ret60 = (value_prices[-1] - value_prices[-60]) / value_prices[-60]
+        spread_60 = g_ret60 - v_ret60
+    else:
+        spread_60 = spread
+
+    # 综合风格得分
+    combined_spread = spread * 0.6 + spread_60 * 0.4
+    style_score = max(0, min(100, 50 + combined_spread * 500))
+
+    if style_score > 60:
+        style = "growth"  # 偏成长
+    elif style_score < 40:
+        style = "value"   # 偏价值
+    else:
+        style = "neutral"
+
+    return {
+        "style": style,
+        "score": round(style_score, 1),
+        "spread_20d": round(spread * 100, 2),
+        "spread_60d": round(spread_60 * 100, 2),
+    }
+
+
 def infer_fund_type(fund_name: str) -> dict:
     """根据基金名称推断基金类型和特征。"""
     name = fund_name.lower()

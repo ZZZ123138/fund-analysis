@@ -15,6 +15,8 @@ import AIAutoTrader from "@/components/AIAutoTrader";
 import CycleIndicator from "@/components/CycleIndicator";
 import MacroClockView from "@/components/MacroClockView";
 import UnderlyingAnalysis from "@/components/UnderlyingAnalysis";
+import MarketMonitor from "@/components/MarketMonitor";
+import AITradingBoard from "@/components/AITradingBoard";
 
 interface Metrics {
   fund_code: string;
@@ -60,12 +62,13 @@ interface FundTypeData {
   characteristics: string[];
 }
 
-type TabKey = "single" | "compare" | "strategy";
+type TabKey = "single" | "compare" | "strategy" | "monitor";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "single", label: "单基金分析" },
   { key: "compare", label: "多基金对比" },
   { key: "strategy", label: "策略回测" },
+  { key: "monitor", label: "市场监控" },
 ];
 
 export default function Home() {
@@ -513,6 +516,20 @@ export default function Home() {
                 请先在上方搜索基金代码
               </div>
             )}
+          </>
+        )}
+
+        {/* ===== 市场监控 ===== */}
+        {activeTab === "monitor" && !loading && (
+          <>
+            <div className="card">
+              <h2>AI 交易看板</h2>
+              <AITradingBoard />
+            </div>
+            <div className="card">
+              <h2>推送配置</h2>
+              <MarketMonitor />
+            </div>
           </>
         )}
       </div>

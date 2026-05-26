@@ -32,7 +32,7 @@ class VirtualAccount(Base):
     __tablename__ = "virtual_account"
 
     id = Column(Integer, primary_key=True, default=1)
-    balance = Column(Float, nullable=False, default=1000000.0)
+    balance = Column(Float, nullable=False, default=100000.0)
 
 
 class VirtualTrade(Base):
@@ -53,6 +53,25 @@ class VirtualTrade(Base):
     )
 
 
+class WatchlistFund(Base):
+    __tablename__ = "watchlist_funds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    fund_code = Column(String, unique=True, index=True, nullable=False)
+    fund_name = Column(String, nullable=True)
+    enabled = Column(Integer, default=1)  # 1=启用, 0=暂停
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class NotificationConfig(Base):
+    __tablename__ = "notification_config"
+
+    id = Column(Integer, primary_key=True, default=1)
+    serverchan_key = Column(String, nullable=True)
+    enabled = Column(Integer, default=0)  # 1=启用, 0=关闭
+    check_interval_minutes = Column(Integer, default=60)
+
+
 class FundReport(Base):
     __tablename__ = "fund_reports"
 
@@ -65,3 +84,12 @@ class FundReport(Base):
     start_date = Column(Date, nullable=True)
     end_date = Column(Date, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class SystemState(Base):
+    """通用键值状态表，用于追踪定投日期、持仓最高净值等"""
+    __tablename__ = "system_state"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
