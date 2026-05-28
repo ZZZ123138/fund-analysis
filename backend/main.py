@@ -2377,6 +2377,61 @@ async def run_anomaly_detection():
     return {"anomalies": anomalies, "count": len(anomalies)}
 
 
+# ==================== 健康检查 ====================
+
+@app.get("/api/health")
+async def health_check(db: Session = Depends(get_db)):
+    """系统健康检查端点"""
+    import pathlib
+    status = {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+    # 检查调度器
+    status["scheduler"] = {
+        "running": scheduler.running,
+        "job_count": len(scheduler.get_jobs())
+    }
+
+    # 检查数据库
+    try:
+        db.execute("SELECT 1")
+        status["database"] = "ok"
+    except Exception as e:
+        status["database"] = f"error: {e}"
+        status["status"] = "degraded"
+
+    # 检查心跳
+    heartbeat_path = pathlib.Path(__file__).parent / ".heartbeat"
+    if heartbeat_path.exists():
+        try:
+            ts = int(heartbeat_path.read_text().strip())
+            age_min = (datetime.now().timestamp() - ts) / 60
+            status["heartbeat"] = {
+                "last_ts": ts,
+                "age_minutes": round(age_min, 1),
+                "stale": age_min > 60
+            }
+            if age_min > 60:
+                status["status"] = "degraded"
+        except Exception:
+            status["heartbeat"] = {"error": "无法读取"}
+    else:
+        status["heartbeat"] = {"error": "文件不存在"}
+
+    # 检查最近交易
+    try:
+        recent_trade = db.query(TradeRecord).order_by(TradeRecord.created_at.desc()).first()
+        if recent_trade:
+            status["last_trade"] = {
+                "time": str(recent_trade.created_at),
+                "fund": recent_trade.fund_name,
+                "action": recent_trade.trade_type
+            }
+    except Exception:
+        pass
+
+    return status
+
+
 # Serve frontend static files
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "out")
 
