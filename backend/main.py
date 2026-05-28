@@ -22,6 +22,7 @@ from constants import (
     FUND_SECTOR, FUND_UNIVERSE, INITIAL_BALANCE, MAX_POSITION_VALUE, MIN_CASH_RESERVE,
     STOP_LOSS, TRAILING_TRIGGER, TRAILING_DRAWDOWN,
     ATR_PERIOD_SHORT, HARD_STOP_ATR_MULTIPLE, TRAILING_STOP_ATR_MULTIPLE, RISK_PER_TRADE_PCT,
+    ASSET_CLASS, ASSET_CLASS_MAX_PCT, ASSET_CLASS_CORRELATION,
 )
 from services.environment import sense_environment, analyze_dual_cycle
 from services.strategy import TrendStrategy, OscillationStrategy, BreakoutStrategy
@@ -692,19 +693,26 @@ async def market_monitor():
                 trades_done.append({
                     "name": fund_names.get(code, code), "code": code,
                     "sector": FUND_SECTOR.get(code, "其他"),
+                    "asset_class": ASSET_CLASS.get(code, "A股"),
                     "action": "卖出", "amount": round(sell_amount, 2),
                     "nav": nav, "reason": reason,
                 })
                 net_shares_map[code] -= sell_shares
 
-        # ==================== 定投：每月第一次扫描买入宽基+商品 ====================
+        # ==================== 定投：每月第一次扫描，全球资产分散 ====================
         dca_key = f"dca_{now.strftime('%Y-%m')}"
         already_dca = db.query(SystemState).filter(SystemState.key == dca_key).first()
 
         dca_done = False
         if not already_dca and now.day <= 5:
-            # 宽基定投 + 商品定投（金额减半，低相关性对冲）
-            dca_sectors = [("宽基", 5000), ("商品", 2500)]
+            # 全球分散定投：A股宽基 + 商品 + 美股 + 港股 + 新兴市场
+            dca_sectors = [
+                ("宽基", 4000),        # A股宽基
+                ("商品", 2000),        # 黄金/商品对冲
+                ("美股", 3000),        # 标普500/纳斯达克
+                ("港股", 2000),        # 港股
+                ("新兴市场", 2000),    # 印度/越南
+            ]
             for sector, max_amount in dca_sectors:
                 dca_funds = [c for c in FUND_UNIVERSE if FUND_SECTOR.get(c) == sector and c in all_prices_map]
                 for code in dca_funds:
@@ -731,7 +739,9 @@ async def market_monitor():
                         db.add(trade)
                         trades_done.append({
                             "name": fund_names.get(code, code), "code": code,
-                            "sector": sector, "action": "定投",
+                            "sector": sector,
+                            "asset_class": ASSET_CLASS.get(code, "A股"),
+                            "action": "定投",
                             "amount": round(buy_amount, 2), "nav": nav,
                             "reason": f"月度定投 {now.strftime('%Y-%m')}（T+1确认）",
                         })
@@ -865,6 +875,18 @@ async def market_monitor():
                     if (sector_value + buy_amount) / total_assets > SECTOR_MAX_PCT:
                         continue  # 板块超限，跳过
 
+                    # 资产类别集中度检查（全球分散化）
+                    asset_class = ASSET_CLASS.get(code, "A股")
+                    ac_group = ASSET_CLASS_CORRELATION.get(asset_class, asset_class)
+                    ac_value = sum(
+                        net_shares_map.get(c, 0) * all_prices_map[c][-1]
+                        for c in FUND_UNIVERSE
+                        if ASSET_CLASS_CORRELATION.get(ASSET_CLASS.get(c, "A股"), ASSET_CLASS.get(c, "A股")) == ac_group
+                        and c in all_prices_map
+                    )
+                    if (ac_value + buy_amount) / total_assets > ASSET_CLASS_MAX_PCT:
+                        continue  # 资产类别超限，跳过
+
                     buy_candidates.append({
                         "code": code, "amount": buy_amount,
                         "rsi": rsi, "signal": signal,
@@ -901,6 +923,7 @@ async def market_monitor():
                     "name": fund_names.get(cand["code"], cand["code"]),
                     "code": cand["code"],
                     "sector": FUND_SECTOR.get(cand["code"], "其他"),
+                    "asset_class": ASSET_CLASS.get(cand["code"], "A股"),
                     "action": "建仓" if net_shares_map.get(cand["code"], 0) <= 0 else "补仓",
                     "amount": round(cand["amount"], 2), "nav": nav,
                     "reason": f"{cand['signal']} RSI={cand['rsi']:.0f} {dual.long_cycle.value}×{dual.short_cycle.value}（T+1确认）",
@@ -938,7 +961,9 @@ async def market_monitor():
             if buys:
                 lines.append(f"\n###   买入 {len(buys)} 笔")
                 for t in buys:
-                    lines.append(f"- {t['action']} {t['name']}({t['code']}) ¥{t['amount']:,.2f} {t['reason']}")
+                    ac = t.get('asset_class', '')
+                    ac_tag = f"[{ac}]" if ac and ac != 'A股' else ''
+                    lines.append(f"- {t['action']} {t['name']}({t['code']}){ac_tag} ¥{t['amount']:,.2f} {t['reason']}")
             if sells:
                 lines.append(f"\n###   卖出 {len(sells)} 笔")
                 for t in sells:
