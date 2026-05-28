@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from sqlalchemy import asc
+from sqlalchemy import asc, func
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -23,6 +23,7 @@ from constants import (
     STOP_LOSS, TRAILING_TRIGGER, TRAILING_DRAWDOWN,
     ATR_PERIOD_SHORT, HARD_STOP_ATR_MULTIPLE, TRAILING_STOP_ATR_MULTIPLE, RISK_PER_TRADE_PCT,
     ASSET_CLASS, ASSET_CLASS_MAX_PCT, ASSET_CLASS_CORRELATION,
+    DAILY_PURCHASE_LIMIT, SUSPENDED_FUNDS,
 )
 from services.environment import sense_environment, analyze_dual_cycle
 from services.strategy import TrendStrategy, OscillationStrategy, BreakoutStrategy
@@ -113,6 +114,17 @@ def _auto_confirm_trades(db: Session):
     if pending or pending_records:
         db.commit()
         print(f"[{datetime.now()}] 自动确认 {len(pending)} 笔交易")
+
+
+def _get_today_purchases(db: Session, fund_code: str) -> float:
+    """获取某基金今日已申购总额（含 pending + confirmed）"""
+    today = date.today()
+    result = db.query(func.sum(VirtualTrade.amount)).filter(
+        VirtualTrade.fund_code == fund_code,
+        VirtualTrade.trade_type == "buy",
+        VirtualTrade.trade_date >= today,
+    ).scalar()
+    return result or 0.0
 
 
 app = FastAPI(title="基金分析系统", version="1.0.0")
@@ -714,7 +726,7 @@ async def market_monitor():
                 ("新兴市场", 2000),    # 印度/越南
             ]
             for sector, max_amount in dca_sectors:
-                dca_funds = [c for c in FUND_UNIVERSE if FUND_SECTOR.get(c) == sector and c in all_prices_map]
+                dca_funds = [c for c in FUND_UNIVERSE if FUND_SECTOR.get(c) == sector and c in all_prices_map and c not in SUSPENDED_FUNDS]
                 for code in dca_funds:
                     available = account.balance - MIN_CASH_RESERVE
                     if available < 2000:
@@ -725,6 +737,14 @@ async def market_monitor():
                         continue
                     nav = all_prices_map[code][-1]
                     buy_amount = min(max_amount, available)
+                    # QDII 每日申购限额
+                    daily_limit = DAILY_PURCHASE_LIMIT.get(code, 0)
+                    if daily_limit > 0:
+                        today_bought = _get_today_purchases(db, code)
+                        remaining = daily_limit - today_bought
+                        if remaining <= 0:
+                            continue
+                        buy_amount = min(buy_amount, remaining)
                     if buy_amount >= 2000:
                         shares = buy_amount / nav
                         account.balance -= buy_amount
@@ -809,6 +829,8 @@ async def market_monitor():
 
             buy_candidates = []
             for code in FUND_UNIVERSE:
+                if code in SUSPENDED_FUNDS:
+                    continue  # 暂停申购，跳过
                 if code not in all_prices_map:
                     continue
                 prices = all_prices_map[code]
@@ -886,6 +908,17 @@ async def market_monitor():
                     )
                     if (ac_value + buy_amount) / total_assets > ASSET_CLASS_MAX_PCT:
                         continue  # 资产类别超限，跳过
+
+                    # QDII 每日申购限额检查
+                    daily_limit = DAILY_PURCHASE_LIMIT.get(code, 0)
+                    if daily_limit > 0:
+                        today_bought = _get_today_purchases(db, code)
+                        remaining_limit = daily_limit - today_bought
+                        if remaining_limit <= 0:
+                            continue  # 今日已达限额，跳过
+                        buy_amount = min(buy_amount, remaining_limit)
+                        if buy_amount < 2000:
+                            continue  # 限额太小，不值得买
 
                     buy_candidates.append({
                         "code": code, "amount": buy_amount,
