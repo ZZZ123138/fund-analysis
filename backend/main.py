@@ -23,7 +23,7 @@ from constants import (
     STOP_LOSS, TRAILING_TRIGGER, TRAILING_DRAWDOWN,
     ATR_PERIOD_SHORT, HARD_STOP_ATR_MULTIPLE, TRAILING_STOP_ATR_MULTIPLE, RISK_PER_TRADE_PCT,
     ASSET_CLASS, ASSET_CLASS_MAX_PCT, ASSET_CLASS_CORRELATION,
-    DAILY_PURCHASE_LIMIT, SUSPENDED_FUNDS,
+    DAILY_PURCHASE_LIMIT, SUSPENDED_FUNDS, QDII_FUNDS,
 )
 from services.environment import sense_environment, analyze_dual_cycle
 from services.strategy import TrendStrategy, OscillationStrategy, BreakoutStrategy
@@ -125,6 +125,21 @@ def _get_today_purchases(db: Session, fund_code: str) -> float:
         VirtualTrade.trade_date >= today,
     ).scalar()
     return result or 0.0
+
+
+def _check_suspended_funds() -> set:
+    """自动检测暂停申购的 QDII 基金"""
+    import requests
+    suspended = set()
+    for code in QDII_FUNDS:
+        try:
+            r = requests.get(f"https://fund.eastmoney.com/{code}.html", timeout=10)
+            if "暂停申购" in r.text or "暂停大额申购" in r.text:
+                suspended.add(code)
+                print(f"  {code} 暂停申购")
+        except Exception as e:
+            print(f"⚠️ {code} 状态检查失败: {e}")
+    return suspended
 
 
 app = FastAPI(title="基金分析系统", version="1.0.0")
@@ -536,6 +551,45 @@ async def market_monitor():
             db.close()
             return
 
+        # ==================== QDII 暂停申购自动检测（每天一次） ====================
+        suspension_key = f"suspended_{today}"
+        cached = db.query(SystemState).filter(SystemState.key == suspension_key).first()
+        if cached:
+            dynamic_suspended = set(cached.value.split(",")) if cached.value else set()
+            # 检查之前暂停的基金是否恢复了
+            for code in list(dynamic_suspended):
+                if code in SUSPENDED_FUNDS:
+                    continue  # 静态配置的不检查恢复
+                try:
+                    import requests
+                    r = requests.get(f"https://fund.eastmoney.com/{code}.html", timeout=10)
+                    if "暂停申购" not in r.text and "暂停大额申购" not in r.text:
+                        dynamic_suspended.discard(code)
+                        print(f"[{now}]   {code} 恢复申购")
+                        await send_serverchan(config.serverchan_key,
+                            "  QDII恢复申购",
+                            f"{code} 已恢复申购，可重新参与买入")
+                        # 更新缓存
+                        cached.value = ",".join(dynamic_suspended)
+                        db.commit()
+                except Exception:
+                    pass
+        else:
+            dynamic_suspended = _check_suspended_funds()
+            # 合并静态配置 + 动态检测
+            all_suspended = SUSPENDED_FUNDS | dynamic_suspended
+            db.add(SystemState(key=suspension_key, value=",".join(all_suspended)))
+            db.commit()
+            new_suspended = dynamic_suspended - SUSPENDED_FUNDS
+            if new_suspended:
+                print(f"[{now}] 发现新暂停基金: {new_suspended}")
+                await send_serverchan(config.serverchan_key,
+                    "⚠️ QDII暂停申购",
+                    f"新发现暂停申购基金: {', '.join(new_suspended)}\n已自动跳过这些基金的买入")
+            dynamic_suspended = all_suspended
+        # 用动态结果替换静态集合（模块级变量不可变，用局部变量覆盖）
+        active_suspended = dynamic_suspended
+
         # 优化2：QDII品种标记（净值T+2延迟，信号容忍2天滞后）
         qdii_stale = {}
         for code in QDII_FUNDS:
@@ -726,7 +780,7 @@ async def market_monitor():
                 ("新兴市场", 2000),    # 印度/越南
             ]
             for sector, max_amount in dca_sectors:
-                dca_funds = [c for c in FUND_UNIVERSE if FUND_SECTOR.get(c) == sector and c in all_prices_map and c not in SUSPENDED_FUNDS]
+                dca_funds = [c for c in FUND_UNIVERSE if FUND_SECTOR.get(c) == sector and c in all_prices_map and c not in active_suspended]
                 for code in dca_funds:
                     available = account.balance - MIN_CASH_RESERVE
                     if available < 2000:
@@ -829,7 +883,7 @@ async def market_monitor():
 
             buy_candidates = []
             for code in FUND_UNIVERSE:
-                if code in SUSPENDED_FUNDS:
+                if code in active_suspended:
                     continue  # 暂停申购，跳过
                 if code not in all_prices_map:
                     continue
