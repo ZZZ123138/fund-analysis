@@ -17,8 +17,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from database import engine, get_db, Base
-from models import Fund, FundNav, FundReport, VirtualAccount, VirtualTrade, WatchlistFund, NotificationConfig, SystemState
-from constants import FUND_SECTOR, FUND_UNIVERSE, INITIAL_BALANCE, MAX_POSITION_VALUE, MIN_CASH_RESERVE, STOP_LOSS, TRAILING_TRIGGER, TRAILING_DRAWDOWN
+from models import Fund, FundNav, FundReport, VirtualAccount, VirtualTrade, WatchlistFund, NotificationConfig, SystemState, StrategyState, TradeRecord, RiskState
+from constants import (
+    FUND_SECTOR, FUND_UNIVERSE, INITIAL_BALANCE, MAX_POSITION_VALUE, MIN_CASH_RESERVE,
+    STOP_LOSS, TRAILING_TRIGGER, TRAILING_DRAWDOWN,
+    ATR_PERIOD_SHORT, HARD_STOP_ATR_MULTIPLE, TRAILING_STOP_ATR_MULTIPLE, RISK_PER_TRADE_PCT,
+)
+from services.environment import sense_environment, analyze_dual_cycle
+from services.strategy import TrendStrategy, OscillationStrategy, BreakoutStrategy
+from services.position import calculate_position_size
+from services.exit_manager import ExitManager
+from services.risk_manager import (
+    update_risk_state, check_circuit_breaker,
+    analyze_r_distribution, get_position_scale_from_r,
+)
 from schemas import FundInfo, FundMetrics, NavPoint, FundReportData, ReportRequest, PortfolioInit, PortfolioBuy, PortfolioSell, WatchlistItem, WatchlistUpdate, NotificationSettings
 from services.fund_data import fetch_fund_nav
 from services.calculator import (
@@ -26,6 +38,7 @@ from services.calculator import (
     calculate_cycle_strength,
     calculate_annual_return,
     calculate_rsi,
+    calculate_atr,
     calculate_industry_score,
     calculate_correlation,
     calculate_crowding_score,
@@ -50,11 +63,65 @@ def validate_fund_code(code: str) -> str:
     return code
 
 
+# ==================== T+1 份额确认逻辑 ====================
+
+_HOLIDAYS_2026 = {
+    date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3),
+    date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),
+    date(2026, 2, 19), date(2026, 2, 20), date(2026, 2, 21),
+    date(2026, 4, 4), date(2026, 4, 5), date(2026, 4, 6),
+    date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3),
+    date(2026, 5, 31), date(2026, 6, 1), date(2026, 6, 2),
+    date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3),
+    date(2026, 10, 4), date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7),
+}
+
+
+def _is_trading_day(d: date) -> bool:
+    if d.weekday() >= 5:
+        return False
+    return d not in _HOLIDAYS_2026
+
+
+def _next_trading_day(d: date, after_15: bool = False) -> date:
+    """返回确认日期：15:00前买入=T+1，15:00后买入=T+2"""
+    from datetime import timedelta
+    days = 2 if after_15 else 1
+    nxt = d + timedelta(days=days)
+    while not _is_trading_day(nxt):
+        nxt += timedelta(days=1)
+    return nxt
+
+
+def _auto_confirm_trades(db: Session):
+    """自动将到期的 pending 交易转为 confirmed"""
+    today = date.today()
+    pending = db.query(VirtualTrade).filter(
+        VirtualTrade.status == "pending",
+        VirtualTrade.confirm_date <= today,
+    ).all()
+    for t in pending:
+        t.status = "confirmed"
+    # 同步 TradeRecord
+    pending_records = db.query(TradeRecord).filter(
+        TradeRecord.status == "pending",
+        TradeRecord.confirm_date <= today,
+    ).all()
+    for r in pending_records:
+        r.status = "confirmed"
+    if pending or pending_records:
+        db.commit()
+        print(f"[{datetime.now()}] 自动确认 {len(pending)} 笔交易")
+
+
 app = FastAPI(title="基金分析系统", version="1.0.0")
 
 
 async def update_all_funds():
     """定时任务：更新所有基金数据"""
+    if not _is_trading_day(date.today()):
+        print(f"[{datetime.now()}] 非交易日，跳过基金数据更新")
+        return
     print(f"[{datetime.now()}] 开始定时更新基金数据...")
     from database import SessionLocal
     db = SessionLocal()
@@ -85,11 +152,13 @@ async def ai_daily_analysis(db) -> str:
         if not account:
             return ""
 
-        # 计算持仓和收益
+        # 计算持仓和收益（只计已确认交易）
         all_trades_all = db.query(VirtualTrade).all()
         net_shares = {}
         cost_map = {}
         for t in all_trades_all:
+            if t.trade_type == "buy" and t.status == "pending":
+                continue
             if t.trade_type == "buy":
                 net_shares[t.fund_code] = net_shares.get(t.fund_code, 0) + t.shares
                 cost_map[t.fund_code] = cost_map.get(t.fund_code, 0) + t.amount
@@ -227,6 +296,9 @@ async def fetch_us_market() -> dict:
 
 async def pre_market_analysis():
     """盘前分析：美股隔夜行情 + A股影响预判"""
+    if not _is_trading_day(date.today()):
+        print(f"[{datetime.now()}] 非交易日，跳过盘前分析")
+        return
     from database import SessionLocal
     db = SessionLocal()
     try:
@@ -270,10 +342,13 @@ async def pre_market_analysis():
             signal = "中性"
             signal_icon = "  "
 
-        # 加载持仓
+        # 加载持仓（只计已确认交易）
+        _auto_confirm_trades(db)
         all_trades = db.query(VirtualTrade).all()
         net_shares_map = {}
         for t in all_trades:
+            if t.trade_type == "buy" and t.status == "pending":
+                continue
             sign = 1 if t.trade_type == "buy" else -1
             net_shares_map[t.fund_code] = net_shares_map.get(t.fund_code, 0) + t.shares * sign
 
@@ -367,7 +442,7 @@ async def send_serverchan(key: str, title: str, content: str):
 
 
 async def market_monitor():
-    """AI 自主交易 V5：定投 + 均线交叉趋势 + 止损止盈"""
+    """AI 自主交易：V5 信号 + V6 风控（ATR 止损/环境仓位/熔断）"""
     from database import SessionLocal
     db = SessionLocal()
     try:
@@ -376,11 +451,26 @@ async def market_monitor():
             return
 
         now = datetime.now()
+        today = date.today()
 
-        fund_universe = FUND_UNIVERSE
+        # 硬约束：14:55后禁止下单（留5分钟缓冲）
+        from constants import ORDER_CUTOFF_HOUR, ORDER_CUTOFF_MINUTE, MIN_HOLD_DAYS_FOR_SELL, QDII_FUNDS, QDII_NAV_DELAY_DAYS
+        if now.hour > ORDER_CUTOFF_HOUR or (now.hour == ORDER_CUTOFF_HOUR and now.minute >= ORDER_CUTOFF_MINUTE):
+            print(f"[{now}] 14:55后禁止下单，跳过扫描")
+            db.close()
+            return
+
+        # 优化1：中国股市节假日检测（跳过非交易日）
+        if not _is_trading_day(today):
+            print(f"[{now}] 非交易日，跳过扫描")
+            db.close()
+            return
+
+        # 自动确认到期的 pending 交易
+        _auto_confirm_trades(db)
 
         # 确保数据存在
-        for code in fund_universe:
+        for code in FUND_UNIVERSE:
             fund = db.query(Fund).filter(Fund.code == code).first()
             if not fund:
                 try:
@@ -395,20 +485,77 @@ async def market_monitor():
             db.commit()
 
         # 加载价格数据
-        all_prices_map = {}
-        fund_names = {}
-        for code in fund_universe:
-            fund = db.query(Fund).filter(Fund.code == code).first()
-            fund_names[code] = fund.name if fund and fund.name else code
-            prices = [r.nav for r in db.query(FundNav.nav)
-                      .filter(FundNav.fund_code == code)
-                      .order_by(FundNav.date.asc()).all()]
-            if len(prices) >= 20:
-                all_prices_map[code] = prices
+        all_prices_map, fund_names = _load_price_data(db, FUND_UNIVERSE)
 
-        # 市场模式判断（用沪深300）
+        # 数据校验：确保数据完整可用
+        data_ok = True
+        issues = []
+        if len(all_prices_map) < 5:
+            data_ok = False
+            issues.append(f"可用基金仅{len(all_prices_map)}只，不足")
+        benchmark_prices = all_prices_map.get("000961", [])
+        if len(benchmark_prices) < 60:
+            data_ok = False
+            issues.append(f"基准000961数据仅{len(benchmark_prices)}条，不足60")
+        # 检查数据新鲜度：基准最新数据应在2天内
+        if benchmark_prices:
+            from models import FundNav as FN
+            latest_nav = db.query(FN.date).filter(FN.fund_code == "000961").order_by(FN.date.desc()).first()
+            if latest_nav:
+                data_age = (today - latest_nav.date).days
+                if data_age > 2:
+                    data_ok = False
+                    issues.append(f"基准数据已过期{data_age}天")
+        if not data_ok:
+            msg = "数据校验失败: " + "; ".join(issues)
+            print(f"[{now}] {msg}")
+            await send_serverchan(config.serverchan_key, "⚠️ 扫描跳过", msg)
+            db.close()
+            return
+
+        # 执行层熔断检查：行为异常时停止交易
+        from services.evolution import check_execution_circuit_breaker
+        cb_status = check_execution_circuit_breaker()
+        if cb_status["halted"]:
+            msg = f"执行层熔断: {cb_status['reason']}"
+            print(f"[{now}] {msg}")
+            await send_serverchan(config.serverchan_key, "   执行层熔断", msg)
+            db.close()
+            return
+
+        # 优化2：QDII品种标记（净值T+2延迟，信号容忍2天滞后）
+        qdii_stale = {}
+        for code in QDII_FUNDS:
+            if code in all_prices_map and len(all_prices_map[code]) >= 3:
+                # QDII最新净值可能是T-2的，记录提醒
+                qdii_stale[code] = True
+
+        # ==================== 环境感知 ====================
         benchmark_code = "000961"
         benchmark_prices = all_prices_map.get(benchmark_code, [])
+        env_coeff = 1.0
+        env_label = "unknown"
+        if len(benchmark_prices) >= 80:
+            env_result = sense_environment(benchmark_prices)
+            env_coeff = env_result.position_coeff
+            env_label = env_result.environment.value
+            # 保存环境快照
+            existing_state = db.query(StrategyState).filter(StrategyState.state_date == today).first()
+            if not existing_state:
+                db.add(StrategyState(
+                    state_date=today,
+                    vol_state=env_result.vol_state.value,
+                    trend_state=env_result.trend_state.value,
+                    environment=env_result.environment.value,
+                    atr_20=env_result.atr_20, atr_60=env_result.atr_60,
+                    adx=env_result.adx,
+                    plus_di=env_result.plus_di, minus_di=env_result.minus_di,
+                    active_strategy=env_result.strategy,
+                    environment_coeff=env_result.position_coeff,
+                ))
+                db.flush()
+
+        # 市场模式判断（兼容旧逻辑）
         if len(benchmark_prices) >= 60:
             ma20_b = sum(benchmark_prices[-20:]) / 20
             ma60_b = sum(benchmark_prices[-60:]) / 60
@@ -419,37 +566,28 @@ async def market_monitor():
 
         max_equity_ratio = 0.80 if market_mode == "trend" else 0.50
 
-        # 组合状态
-        all_trades = db.query(VirtualTrade).all()
-        net_shares_map = {}
-        cost_basis_map = {}  # 平均成本
-        for t in all_trades:
-            if t.trade_type == "buy":
-                net_shares_map[t.fund_code] = net_shares_map.get(t.fund_code, 0) + t.shares
-                cost_basis_map[t.fund_code] = cost_basis_map.get(t.fund_code, 0) + t.amount
-            else:
-                # 卖出时按比例减少成本
-                if t.fund_code in net_shares_map and net_shares_map[t.fund_code] > 0:
-                    sell_ratio = t.shares / (net_shares_map[t.fund_code] + t.shares) if (net_shares_map[t.fund_code] + t.shares) > 0 else 0
-                    cost_basis_map[t.fund_code] = cost_basis_map.get(t.fund_code, 0) * (1 - sell_ratio)
-                net_shares_map[t.fund_code] = net_shares_map.get(t.fund_code, 0) - t.shares
-
+        # ==================== 风控：熔断检查 ====================
+        net_shares_map, cost_basis_map, held_funds = _compute_holdings(db)
         holdings_value = 0
-        held_funds = []
-        for fc, ns in net_shares_map.items():
-            if ns > 0.0001:
-                nav_row = db.query(FundNav.nav).filter(FundNav.fund_code == fc).order_by(FundNav.date.desc()).first()
-                if nav_row:
-                    holdings_value += ns * nav_row[0]
-                    held_funds.append(fc)
-
+        for fc in held_funds:
+            holdings_value += net_shares_map[fc] * all_prices_map[fc][-1]
         total_assets = holdings_value + account.balance
 
-        trades_done = []
-        signals = []
+        risk_state = update_risk_state(
+            db, today, daily_pnl=0, daily_pnl_pct=0,
+            total_assets=total_assets, initial_balance=INITIAL_BALANCE,
+            strategy_name=market_mode,
+        )
+        cb = check_circuit_breaker(risk_state)
+        if not cb["allowed"]:
+            print(f"[{now}] 熔断: {cb['reason']}")
+            db.commit()
+            return
+        position_scale = cb.get("position_scale", 1.0)
 
-        # ==================== 止损 / 止盈 ====================
-        # 加载持仓状态（最高净值、均线状态）
+        trades_done = []
+
+        # ==================== 止损 / 止盈（V6: ATR 自适应） ====================
         state_rows = db.query(SystemState).filter(
             SystemState.key.like("highest_nav_%") | SystemState.key.like("ma_state_%")
         ).all()
@@ -467,8 +605,9 @@ async def market_monitor():
             avg_cost = cost_basis_map.get(code, 0) / ns if ns > 0 else nav
             pnl_pct = (nav - avg_cost) / avg_cost if avg_cost > 0 else 0
             rsi = calculate_rsi(prices)
+            atr = calculate_atr(prices, ATR_PERIOD_SHORT)
 
-            # --- 移动止盈：追踪最高净值 ---
+            # 移动止盈：追踪最高净值
             hn_key = f"highest_nav_{code}"
             prev_highest = float(state_map.get(hn_key, nav))
             current_highest = max(prev_highest, nav)
@@ -478,10 +617,7 @@ async def market_monitor():
             else:
                 db.add(SystemState(key=hn_key, value=str(current_highest)))
 
-            from_peak = (nav - current_highest) / current_highest if current_highest > 0 else 0
-            trailing_active = pnl_pct >= TRAILING_TRIGGER
-
-            # --- 均线死叉检测 ---
+            # 均线死叉检测
             ma_key = f"ma_state_{code}"
             prev_ma = state_map.get(ma_key, "below")
             if len(prices) >= 20:
@@ -496,36 +632,63 @@ async def market_monitor():
                 db.add(SystemState(key=ma_key, value=cur_ma))
 
             should_sell = False
-            sell_ratio = 0
+            sell_ratio_val = 0.0
             reason = ""
 
-            # 1. 止损：亏损超过 7%
-            if pnl_pct <= STOP_LOSS:
-                should_sell, sell_ratio = True, 1.0
-                reason = f"止损 {pnl_pct*100:.1f}%"
-            # 2. 移动止盈：盈利超 5% 后从高点回撤 3%
-            elif trailing_active and from_peak <= -TRAILING_DRAWDOWN:
-                should_sell, sell_ratio = True, 1.0
-                reason = f"止盈 {pnl_pct*100:.1f}% 从高点{from_peak*100:.1f}%"
+            # 硬约束：持有不足7天禁止赎回
+            latest_buy = db.query(VirtualTrade).filter(
+                VirtualTrade.fund_code == code,
+                VirtualTrade.trade_type == "buy",
+            ).order_by(VirtualTrade.trade_date.desc()).first()
+            if latest_buy:
+                days_held = (now - latest_buy.trade_date).days
+                if days_held < MIN_HOLD_DAYS_FOR_SELL:
+                    print(f"[{now}] {code} 持有{days_held}天 < 7天，禁止赎回")
+                    continue
+
+            # 1. ATR 硬止损：入场价 - 2*ATR（替代固定 -7%）
+            atr_stop_price = avg_cost - HARD_STOP_ATR_MULTIPLE * atr
+            if nav <= atr_stop_price:
+                should_sell, sell_ratio_val = True, 1.0
+                reason = f"ATR止损 {pnl_pct*100:.1f}% (止损价={atr_stop_price:.4f})"
+            # 2. ATR 移动止盈：从高点回落 1.5*ATR（替代固定 5%/3%）
+            elif current_highest > avg_cost and atr > 0:
+                trailing_stop_price = current_highest - TRAILING_STOP_ATR_MULTIPLE * atr
+                if nav <= trailing_stop_price:
+                    should_sell, sell_ratio_val = True, 1.0
+                    reason = f"ATR止盈 {pnl_pct*100:.1f}% 从高点回落1.5ATR"
             # 3. RSI 超买
             elif rsi > 72:
-                should_sell, sell_ratio = True, 1.0
+                should_sell, sell_ratio_val = True, 1.0
                 reason = f"RSI={rsi:.0f} 超买"
             # 4. 均线死叉：跌破 20MA 且持仓盈利
             elif cur_ma == "below" and prev_ma == "above" and pnl_pct > 0:
-                should_sell, sell_ratio = True, 1.0
+                should_sell, sell_ratio_val = True, 1.0
                 reason = f"跌破20MA 盈利{pnl_pct*100:.1f}%"
+            # 5. 持仓老化：持有>30天且收益<3%，释放资金
+            elif days_held > 30 and pnl_pct < 0.03:
+                should_sell, sell_ratio_val = True, 0.5
+                reason = f"持仓老化 {days_held}天 收益仅{pnl_pct*100:.1f}%"
 
             if should_sell:
-                sell_shares = ns * sell_ratio
+                sell_shares = ns * sell_ratio_val
                 sell_amount = sell_shares * nav
                 account.balance += sell_amount
                 trade = VirtualTrade(
                     fund_code=code, fund_name=fund_names.get(code, code),
                     trade_type="sell", shares=sell_shares,
                     nav=nav, amount=sell_amount,
+                    status="confirmed",
                 )
                 db.add(trade)
+                db.add(TradeRecord(
+                    fund_code=code, fund_name=fund_names.get(code, code),
+                    trade_type="sell", shares=sell_shares,
+                    nav=nav, amount=sell_amount,
+                    status="confirmed",
+                    strategy_name=market_mode, environment=env_label,
+                    exit_reason="stop" if "止损" in reason else "other",
+                ))
                 trades_done.append({
                     "name": fund_names.get(code, code), "code": code,
                     "sector": FUND_SECTOR.get(code, "其他"),
@@ -534,47 +697,100 @@ async def market_monitor():
                 })
                 net_shares_map[code] -= sell_shares
 
-        # ==================== 定投：每月第一次扫描买入宽基 ====================
+        # ==================== 定投：每月第一次扫描买入宽基+商品 ====================
         dca_key = f"dca_{now.strftime('%Y-%m')}"
         already_dca = db.query(SystemState).filter(SystemState.key == dca_key).first()
 
         dca_done = False
-        if not already_dca and now.day <= 5:  # 每月前5天执行定投，且当月未执行过
-            dca_funds = [c for c in fund_universe if FUND_SECTOR.get(c) == "宽基" and c in all_prices_map]
-            for code in dca_funds:
-                available = account.balance - MIN_CASH_RESERVE
-                if available < 3000:
-                    break
-                ns = net_shares_map.get(code, 0)
-                current_value = ns * all_prices_map[code][-1] if ns > 0 else 0
-                if current_value >= MAX_POSITION_VALUE:
-                    continue
-                nav = all_prices_map[code][-1]
-                buy_amount = min(5000, available)
-                if buy_amount >= 2000:
-                    shares = buy_amount / nav
-                    account.balance -= buy_amount
-                    trade = VirtualTrade(
-                        fund_code=code, fund_name=fund_names.get(code, code),
-                        trade_type="buy", shares=shares,
-                        nav=nav, amount=buy_amount,
-                    )
-                    db.add(trade)
-                    trades_done.append({
-                        "name": fund_names.get(code, code), "code": code,
-                        "sector": "宽基", "action": "定投",
-                        "amount": round(buy_amount, 2), "nav": nav,
-                        "reason": f"月度定投 {now.strftime('%Y-%m')}",
-                    })
-                    net_shares_map[code] = net_shares_map.get(code, 0) + shares
-                    dca_done = True
+        if not already_dca and now.day <= 5:
+            # 宽基定投 + 商品定投（金额减半，低相关性对冲）
+            dca_sectors = [("宽基", 5000), ("商品", 2500)]
+            for sector, max_amount in dca_sectors:
+                dca_funds = [c for c in FUND_UNIVERSE if FUND_SECTOR.get(c) == sector and c in all_prices_map]
+                for code in dca_funds:
+                    available = account.balance - MIN_CASH_RESERVE
+                    if available < 2000:
+                        break
+                    ns = net_shares_map.get(code, 0)
+                    current_value = ns * all_prices_map[code][-1] if ns > 0 else 0
+                    if current_value >= MAX_POSITION_VALUE:
+                        continue
+                    nav = all_prices_map[code][-1]
+                    buy_amount = min(max_amount, available)
+                    if buy_amount >= 2000:
+                        shares = buy_amount / nav
+                        account.balance -= buy_amount
+                        after_15 = datetime.now().hour >= 15
+                        confirm_dt = _next_trading_day(today, after_15)
+                        trade = VirtualTrade(
+                            fund_code=code, fund_name=fund_names.get(code, code),
+                            trade_type="buy", trade_label="定投", shares=shares,
+                            nav=nav, amount=buy_amount,
+                            status="pending", confirm_date=confirm_dt,
+                        )
+                        db.add(trade)
+                        trades_done.append({
+                            "name": fund_names.get(code, code), "code": code,
+                            "sector": sector, "action": "定投",
+                            "amount": round(buy_amount, 2), "nav": nav,
+                            "reason": f"月度定投 {now.strftime('%Y-%m')}（T+1确认）",
+                        })
+                        dca_done = True
             if dca_done:
                 db.add(SystemState(key=dca_key, value=now.isoformat()))
                 db.flush()
 
-        # ==================== 战术买入（仅趋势市） ====================
+        # ==================== R 分布 + 凸性检查 ====================
+        from models import TradeRecord as TRModel
+        recent_trades = db.query(TRModel.r_multiple).filter(
+            TRModel.r_multiple.isnot(None)
+        ).order_by(TRModel.trade_date.desc()).limit(50).all()
+        r_values = [t.r_multiple for t in recent_trades if t.r_multiple is not None]
+        r_scale = get_position_scale_from_r(r_values)
+        r_dist = analyze_r_distribution(r_values) if r_values else None
+
+        if r_scale == 0:
+            print(f"[{now}] 凸性暂停：策略收益分布呈凹性，暂停开仓")
+            db.commit()
+            if trades_done:
+                title = f"AI交易：{len(trades_done)}笔 凸性暂停"
+                content = f"## AI交易报告\n\n**R分布**: {r_dist['verdict'] if r_dist else '无数据'}\n\n卖出 {len(trades_done)} 笔已完成"
+                await send_serverchan(config.serverchan_key, title, content)
+            return
+
+        # ==================== 优化3：板块相对强度排名 ====================
+        sector_momentum = {}
+        for code in FUND_UNIVERSE:
+            if code not in all_prices_map:
+                continue
+            prices = all_prices_map[code]
+            if len(prices) >= 20:
+                mom = (prices[-1] - prices[-20]) / prices[-20]  # 20日动量
+                sector = FUND_SECTOR.get(code, "其他")
+                if sector not in sector_momentum:
+                    sector_momentum[sector] = []
+                sector_momentum[sector].append(mom)
+        # 计算板块平均动量并排名
+        sector_rank = {}
+        for sector, moms in sector_momentum.items():
+            sector_rank[sector] = sum(moms) / len(moms)
+        sorted_sectors = sorted(sector_rank.items(), key=lambda x: x[1], reverse=True)
+        if sorted_sectors:
+            print(f"[{now}] 板块强度: {', '.join(f'{s}={m*100:.1f}%' for s, m in sorted_sectors)}")
+
+        # 市场宽度：站上20日均线的比例
+        above_ma20 = 0
+        total_with_ma = 0
+        for code in FUND_UNIVERSE:
+            if code in all_prices_map and len(all_prices_map[code]) >= 20:
+                total_with_ma += 1
+                if all_prices_map[code][-1] > sum(all_prices_map[code][-20:]) / 20:
+                    above_ma20 += 1
+        breadth_pct = above_ma20 / total_with_ma * 100 if total_with_ma > 0 else 0
+        print(f"[{now}] 市场宽度: {above_ma20}/{total_with_ma} ({breadth_pct:.0f}%) 站上MA20")
+
+        # ==================== 战术买入（V5 信号 + V6 仓位 + 双周期矩阵） ====================
         if market_mode == "trend":
-            # 重新计算持仓
             holdings_value = 0
             for fc, ns in net_shares_map.items():
                 if ns > 0.0001 and fc in all_prices_map:
@@ -582,7 +798,7 @@ async def market_monitor():
             total_assets = holdings_value + account.balance
 
             buy_candidates = []
-            for code in fund_universe:
+            for code in FUND_UNIVERSE:
                 if code not in all_prices_map:
                     continue
                 prices = all_prices_map[code]
@@ -594,7 +810,6 @@ async def market_monitor():
                 ma60_val = sum(prices[-60:]) / 60
                 rsi = calculate_rsi(prices)
 
-                # 前一天的均线状态
                 prev_close = prices[-2] if len(prices) >= 2 else close
                 prev_ma20 = sum(prices[-21:-1]) / 20 if len(prices) >= 21 else ma20_val
 
@@ -606,17 +821,29 @@ async def market_monitor():
                 if rsi > 68:
                     continue
 
+                # 双周期矩阵过滤：只在正期望单元格开仓
+                dual = analyze_dual_cycle(prices)
+                if dual.allowed_strategy == "none" and dual.cell_expectation == "negative":
+                    continue  # 下跌趋势或无正期望，跳过
+
                 ns = net_shares_map.get(code, 0)
                 current_value = ns * close if ns > 0 else 0
                 if current_value >= MAX_POSITION_VALUE:
                     continue
 
-                base = 5000 if golden_cross else 3000
+                # 仓位：ATR 风险平价 × 环境系数 × 熔断系数 × R分布系数
+                atr = calculate_atr(prices, ATR_PERIOD_SHORT)
+                risk_budget = total_assets * RISK_PER_TRADE_PCT
+                atr_pct = atr / close if close > 0 else 0.01
+                base_from_atr = risk_budget / atr_pct if atr_pct > 0 else 5000
+                base = base_from_atr * env_coeff * position_scale * r_scale
+                base = max(2000, min(8000, base))
+
                 if current_value > 0:
                     remaining = MAX_POSITION_VALUE - current_value
                     if remaining <= 0:
                         continue
-                    base = min(base, remaining, 3000)
+                    base = min(base, remaining)
 
                 available_for_equity = total_assets * max_equity_ratio - holdings_value
                 if available_for_equity <= 0:
@@ -628,38 +855,83 @@ async def market_monitor():
 
                 if buy_amount >= 2000:
                     signal = "金叉" if golden_cross else "趋势"
+                    # 板块集中度检查
+                    sector = FUND_SECTOR.get(code, "其他")
+                    sector_value = sum(
+                        net_shares_map.get(c, 0) * all_prices_map[c][-1]
+                        for c in FUND_UNIVERSE
+                        if FUND_SECTOR.get(c) == sector and c in all_prices_map
+                    )
+                    if (sector_value + buy_amount) / total_assets > SECTOR_MAX_PCT:
+                        continue  # 板块超限，跳过
+
                     buy_candidates.append({
                         "code": code, "amount": buy_amount,
                         "rsi": rsi, "signal": signal,
+                        "dual": dual,
                     })
 
             buy_candidates.sort(key=lambda x: x["rsi"])
+            after_15 = datetime.now().hour >= 15
+            confirm_dt = _next_trading_day(today, after_15)
             for cand in buy_candidates:
                 nav = all_prices_map[cand["code"]][-1]
                 shares = cand["amount"] / nav
                 account.balance -= cand["amount"]
+                _label = "建仓" if net_shares_map.get(cand["code"], 0) <= 0 else "补仓"
                 trade = VirtualTrade(
                     fund_code=cand["code"], fund_name=fund_names.get(cand["code"], cand["code"]),
-                    trade_type="buy", shares=shares,
+                    trade_type="buy", trade_label=_label, shares=shares,
                     nav=nav, amount=cand["amount"],
+                    status="pending", confirm_date=confirm_dt,
                 )
                 db.add(trade)
+                dual = cand["dual"]
+                db.add(TradeRecord(
+                    fund_code=cand["code"],
+                    fund_name=fund_names.get(cand["code"], cand["code"]),
+                    trade_type="buy", trade_label=_label, shares=shares,
+                    nav=nav, amount=cand["amount"],
+                    status="pending", confirm_date=confirm_dt,
+                    strategy_name=market_mode, environment=env_label,
+                    initial_risk=calculate_atr(all_prices_map[cand["code"]], ATR_PERIOD_SHORT) * HARD_STOP_ATR_MULTIPLE,
+                    position_size_rationale=f"长周期={dual.long_cycle.value} 短周期={dual.short_cycle.value} R缩放={r_scale:.1f}",
+                ))
                 trades_done.append({
                     "name": fund_names.get(cand["code"], cand["code"]),
                     "code": cand["code"],
                     "sector": FUND_SECTOR.get(cand["code"], "其他"),
                     "action": "建仓" if net_shares_map.get(cand["code"], 0) <= 0 else "补仓",
                     "amount": round(cand["amount"], 2), "nav": nav,
-                    "reason": f"{cand['signal']} RSI={cand['rsi']:.0f} {market_mode}",
+                    "reason": f"{cand['signal']} RSI={cand['rsi']:.0f} {dual.long_cycle.value}×{dual.short_cycle.value}（T+1确认）",
                 })
-                net_shares_map[cand["code"]] = net_shares_map.get(cand["code"], 0) + shares
 
         db.commit()
 
         # ==================== 推送结果 ====================
+        # 计算持仓概况
+        holdings_count = sum(1 for ns in net_shares_map.values() if ns > 0.0001)
+        r_info = f" | **R期望**: {r_dist['expectation']:.2f} ({r_dist['health']})" if r_dist else ""
+
+        # 优化4：绩效指标（胜率、平均R、板块强度、市场宽度）
+        win_trades = [r for r in r_values if r > 0] if r_values else []
+        loss_trades = [r for r in r_values if r <= 0] if r_values else []
+        win_rate = len(win_trades) / len(r_values) * 100 if r_values else 0
+        avg_r = sum(r_values) / len(r_values) if r_values else 0
+        top_sector = sorted_sectors[0] if sorted_sectors else ("--", 0)
+        breadth_label = "强" if breadth_pct >= 60 else "中" if breadth_pct >= 40 else "弱"
+
         if trades_done:
             lines = [f"## AI交易报告 ({now.strftime('%H:%M')})\n"]
-            lines.append(f"**市场模式**: {'趋势市' if market_mode=='trend' else '震荡市'} | **余额**: ¥{account.balance:,.2f}")
+            lines.append(
+                f"**环境**: {env_label} | "
+                f"**市场**: {'趋势' if market_mode=='trend' else '震荡'} | "
+                f"**仓位系数**: {env_coeff}×{r_scale:.1f} | **余额**: ¥{account.balance:,.2f}{r_info}\n"
+                f"**胜率**: {win_rate:.0f}% ({len(win_trades)}/{len(r_values)}) | "
+                f"**均R**: {avg_r:.2f} | "
+                f"**最强板块**: {top_sector[0]}({top_sector[1]*100:+.1f}%) | "
+                f"**市场宽度**: {breadth_pct:.0f}%{breadth_label}"
+            )
 
             buys = [t for t in trades_done if t["action"] in ("建仓", "补仓", "定投")]
             sells = [t for t in trades_done if t["action"] == "卖出"]
@@ -672,18 +944,149 @@ async def market_monitor():
                 for t in sells:
                     lines.append(f"- {t['action']} {t['name']}({t['code']}) ¥{t['amount']:,.2f} {t['reason']}")
 
-            title = f"AI交易：{len(trades_done)}笔 {'趋势' if market_mode=='trend' else '震荡'}"
+            title = f"AI交易：{len(trades_done)}笔 {env_label}"
             content = "\n".join(lines)
             await send_serverchan(config.serverchan_key, title, content)
-            print(f"[{now}] V5: {len(trades_done)}笔 {market_mode}")
+            print(f"[{now}] {len(trades_done)}笔 {env_label} {market_mode}")
         else:
-            print(f"[{now}] V5: 无操作 {market_mode}")
+            # 无交易时也推送状态，确认系统正常运行
+            title = f"AI监控：无操作 {env_label}"
+            content = (
+                f"## AI监控报告 ({now.strftime('%H:%M')})\n\n"
+                f"**环境**: {env_label} | "
+                f"**市场**: {'趋势' if market_mode=='trend' else '震荡'} | "
+                f"**持仓**: {holdings_count}只 | **余额**: ¥{account.balance:,.2f}{r_info}\n"
+                f"**胜率**: {win_rate:.0f}% | **均R**: {avg_r:.2f} | "
+                f"**最强板块**: {top_sector[0]}({top_sector[1]*100:+.1f}%) | "
+                f"**市场宽度**: {breadth_pct:.0f}%{breadth_label}\n\n"
+                f"本轮扫描未触发交易信号，系统持续监控中。"
+            )
+            await send_serverchan(config.serverchan_key, title, content)
+            print(f"[{now}] 无操作 {env_label} {market_mode}")
+
+        # ==================== 每日净值快照 ====================
+        # 重新计算持仓（交易可能已改变余额/持仓）
+        net_shares_map, _, held_funds = _compute_holdings(db)
+        holdings_value = 0
+        for fc in held_funds:
+            if fc in all_prices_map:
+                holdings_value += net_shares_map[fc] * all_prices_map[fc][-1]
+        total_assets = holdings_value + account.balance
+        holdings_count = sum(1 for ns in net_shares_map.values() if ns > 0.0001)
+
+        from models import DailySnapshot
+        existing_snap = db.query(DailySnapshot).filter(DailySnapshot.snapshot_date == today).first()
+        if not existing_snap:
+            # 基准收益
+            benchmark_prices = all_prices_map.get("000961", [])
+            bench_ret = 0
+            if len(benchmark_prices) >= 2:
+                bench_ret = (benchmark_prices[-1] - benchmark_prices[-2]) / benchmark_prices[-2]
+
+            # 历史最大回撤
+            prev_snaps = db.query(DailySnapshot).order_by(DailySnapshot.snapshot_date.desc()).limit(60).all()
+            peak = total_assets
+            for s in prev_snaps:
+                peak = max(peak, s.total_assets)
+            dd = (total_assets - peak) / peak if peak > 0 else 0
+            hist_max_dd = min(dd, min((s.max_drawdown or 0) for s in prev_snaps)) if prev_snaps else dd
+
+            # 累计收益
+            cum_ret = (total_assets - INITIAL_BALANCE) / INITIAL_BALANCE
+            bench_cum = 0
+            if prev_snaps and prev_snaps[0].benchmark_cumulative is not None:
+                bench_cum = prev_snaps[0].benchmark_cumulative + bench_ret
+            else:
+                bench_cum = bench_ret
+
+            # 策略当日收益
+            prev_total = prev_snaps[0].total_assets if prev_snaps else INITIAL_BALANCE
+            daily_ret = (total_assets - prev_total) / prev_total if prev_total > 0 else 0
+
+            db.add(DailySnapshot(
+                snapshot_date=today,
+                total_assets=round(total_assets, 2),
+                balance=round(account.balance, 2),
+                holdings_value=round(holdings_value, 2),
+                holdings_count=holdings_count,
+                daily_return=round(daily_ret, 6),
+                cumulative_return=round(cum_ret, 6),
+                max_drawdown=round(hist_max_dd, 6),
+                benchmark_return=round(bench_ret, 6),
+                benchmark_cumulative=round(bench_cum, 6),
+            ))
+            db.commit()
+            print(f"[{now}] 净值快照: 总资产={total_assets:.2f} 累计={cum_ret*100:.2f}% 最大回撤={hist_max_dd*100:.2f}%")
+
+        # ==================== 行为指纹更新 + 异常检测 ====================
+        try:
+            from services.evolution import update_behavior_fingerprints, detect_anomalies
+            update_behavior_fingerprints()
+            anomalies = detect_anomalies()
+            if anomalies:
+                for a in anomalies:
+                    print(f"[{now}] 异常告警: {a['detail']} (z={a['z_score']})")
+                    if a["severity"] == "critical":
+                        await send_serverchan(config.serverchan_key, "⚠️ 执行层异常", a["detail"])
+        except Exception as e:
+            print(f"[{now}] 行为检测异常: {e}")
+    except Exception as e:
+        # 扫描失败告警：确保异常不会被静默吞掉
+        error_msg = f"扫描异常: {type(e).__name__}: {e}"
+        print(f"[{datetime.now()}] {error_msg}")
+        try:
+            config = db.query(NotificationConfig).filter(NotificationConfig.id == 1).first()
+            if config and config.serverchan_key:
+                await send_serverchan(config.serverchan_key, "⚠️ 扫描异常", error_msg)
+        except Exception:
+            pass
     finally:
         db.close()
 
 
+def _load_price_data(db, fund_universe: list[str]) -> tuple[dict[str, list[float]], dict[str, str]]:
+    """加载价格数据和基金名称，返回 (价格字典, 名称字典)"""
+    prices_map = {}
+    names_map = {}
+    for code in fund_universe:
+        fund = db.query(Fund).filter(Fund.code == code).first()
+        names_map[code] = fund.name if fund and fund.name else code
+        prices = [r.nav for r in db.query(FundNav.nav)
+                  .filter(FundNav.fund_code == code)
+                  .order_by(FundNav.date.asc()).all()]
+        if len(prices) >= 20:
+            prices_map[code] = prices
+    return prices_map, names_map
+
+
+def _compute_holdings(db) -> tuple[dict[str, float], dict[str, float], list[str]]:
+    """计算当前持仓：返回 (份额字典, 成本字典, 持仓代码列表)
+    只计算已确认的交易，pending 买入不计入持仓。"""
+    _auto_confirm_trades(db)
+    all_trades = db.query(VirtualTrade).all()
+    net_shares = {}
+    cost_basis = {}
+    for t in all_trades:
+        # 买入且未确认 → 不计入持仓
+        if t.trade_type == "buy" and t.status == "pending":
+            continue
+        if t.trade_type == "buy":
+            net_shares[t.fund_code] = net_shares.get(t.fund_code, 0) + t.shares
+            cost_basis[t.fund_code] = cost_basis.get(t.fund_code, 0) + t.amount
+        else:
+            if t.fund_code in net_shares and net_shares[t.fund_code] > 0:
+                sell_ratio = t.shares / (net_shares[t.fund_code] + t.shares) if (net_shares[t.fund_code] + t.shares) > 0 else 0
+                cost_basis[t.fund_code] = cost_basis.get(t.fund_code, 0) * (1 - sell_ratio)
+            net_shares[t.fund_code] = net_shares.get(t.fund_code, 0) - t.shares
+    held = [fc for fc, ns in net_shares.items() if ns > 0.0001]
+    return net_shares, cost_basis, held
+
+
 async def post_market_analysis():
     """盘后 AI 分析报告（18:05，数据更新后）"""
+    if not _is_trading_day(date.today()):
+        print(f"[{datetime.now()}] 非交易日，跳过盘后分析")
+        return
     from database import SessionLocal
     db = SessionLocal()
     try:
@@ -714,20 +1117,28 @@ async def startup_event():
         name="每日更新基金数据",
         replace_existing=True
     )
-    # 开盘期间每小时监控基金信号（周一到周五 9:30-15:00）
-    scheduler.add_job(
-        market_monitor,
-        CronTrigger(day_of_week="mon-fri", hour="9-14", minute=30),
-        id="market_monitor",
-        name="市场信号监控",
-        replace_existing=True,
-    )
-    # 盘前分析（周一到周五 8:30）
+    # 盘前分析：8:30（环境感知 + 板块强度 + 持仓概况）
     scheduler.add_job(
         pre_market_analysis,
         CronTrigger(day_of_week="mon-fri", hour=8, minute=30),
         id="pre_market_analysis",
         name="盘前分析",
+        replace_existing=True,
+    )
+    # 早盘扫描：9:30（T-1净值信号 → T日收盘成交）
+    scheduler.add_job(
+        market_monitor,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=30),
+        id="market_monitor_morning",
+        name="早盘扫描",
+        replace_existing=True,
+    )
+    # 午盘扫描：14:50（T-1净值信号 → T日收盘成交，14:55前截止）
+    scheduler.add_job(
+        market_monitor,
+        CronTrigger(day_of_week="mon-fri", hour=14, minute=50),
+        id="market_monitor_afternoon",
+        name="午盘扫描",
         replace_existing=True,
     )
     # 盘后 AI 分析（周一到周五 18:05，数据更新后）
@@ -738,8 +1149,32 @@ async def startup_event():
         name="盘后AI分析",
         replace_existing=True,
     )
+    # 心跳：每 30 分钟写入时间戳，供外部监控检测服务存活
+    def _write_heartbeat():
+        import pathlib
+        heartbeat_path = pathlib.Path(__file__).parent / ".heartbeat"
+        heartbeat_path.write_text(str(int(datetime.now().timestamp())))
+
+    scheduler.add_job(_write_heartbeat, CronTrigger(minute="0,30"), id="heartbeat", name="心跳", replace_existing=True)
+    _write_heartbeat()  # 启动时立即写一次
+
     scheduler.start()
     print("定时任务调度器已启动")
+
+    # 启动通知：告知用户系统已上线
+    try:
+        from database import SessionLocal
+        db = SessionLocal()
+        config = db.query(NotificationConfig).filter(NotificationConfig.id == 1).first()
+        if config and config.enabled and config.serverchan_key:
+            jobs = [f"- {job.name} ({job.next_run_time.strftime('%m-%d %H:%M') if job.next_run_time else '未调度'})"
+                    for job in scheduler.get_jobs()]
+            content = f"##   系统启动通知\n\n**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n**定时任务**:\n" + "\n".join(jobs)
+            await send_serverchan(config.serverchan_key, "系统已启动", content)
+            print("启动通知已发送")
+        db.close()
+    except Exception as e:
+        print(f"启动通知发送失败: {e}")
 
 
 @app.on_event("shutdown")
@@ -969,14 +1404,19 @@ async def buy_fund(body: PortfolioBuy, db: Session = Depends(get_db)):
 
     shares = body.amount / latest_nav.nav
     account.balance -= body.amount
+    after_15 = datetime.now().hour >= 15
+    confirm_dt = _next_trading_day(date.today(), after_15)
 
     trade = VirtualTrade(
         fund_code=code,
         fund_name=fund_name,
         trade_type="buy",
+        trade_label="手动",
         shares=shares,
         nav=latest_nav.nav,
         amount=body.amount,
+        status="pending",
+        confirm_date=confirm_dt,
     )
     db.add(trade)
     db.commit()
@@ -988,6 +1428,9 @@ async def buy_fund(body: PortfolioBuy, db: Session = Depends(get_db)):
         "nav": latest_nav.nav,
         "amount": body.amount,
         "balance": round(account.balance, 2),
+        "status": "pending",
+        "confirm_date": confirm_dt.isoformat(),
+        "trade_label": "手动",
     }
 
 
@@ -1000,10 +1443,11 @@ async def sell_fund(body: PortfolioSell, db: Session = Depends(get_db)):
     if not account:
         raise HTTPException(status_code=400, detail="请先初始化账户")
 
-    # 计算持有份额
+    # 计算持有份额（只计已确认的买入）
+    _auto_confirm_trades(db)
     buys = (
         db.query(VirtualTrade)
-        .filter(VirtualTrade.fund_code == code, VirtualTrade.trade_type == "buy")
+        .filter(VirtualTrade.fund_code == code, VirtualTrade.trade_type == "buy", VirtualTrade.status == "confirmed")
         .all()
     )
     sells = (
@@ -1013,7 +1457,7 @@ async def sell_fund(body: PortfolioSell, db: Session = Depends(get_db)):
     )
     total_shares = sum(t.shares for t in buys) - sum(t.shares for t in sells)
     if total_shares <= 0:
-        raise HTTPException(status_code=400, detail="未持有该基金")
+        raise HTTPException(status_code=400, detail="未持有该基金（如有待确认买入，需等T+1确认后方可卖出）")
 
     latest_nav = (
         db.query(FundNav)
@@ -1035,6 +1479,7 @@ async def sell_fund(body: PortfolioSell, db: Session = Depends(get_db)):
         shares=total_shares,
         nav=latest_nav.nav,
         amount=sell_amount,
+        status="confirmed",
     )
     db.add(trade)
     db.commit()
@@ -1053,12 +1498,19 @@ async def get_holdings(db: Session = Depends(get_db)):
     """查询持仓列表。"""
     account = db.query(VirtualAccount).filter(VirtualAccount.id == 1).first()
     if not account:
-        return {"balance": 0, "holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0}
+        return {"balance": 0, "holdings": [], "total_value": 0, "total_cost": 0, "total_pnl": 0, "pending_trades": []}
 
+    _auto_confirm_trades(db)
     trades = db.query(VirtualTrade).all()
-    # 按基金汇总
+
+    # 分离已确认和待确认的买入
+    pending_buy_trades = [t for t in trades if t.trade_type == "buy" and t.status == "pending"]
+
+    # 按基金汇总（只计已确认交易）
     fund_map: dict[str, dict] = {}
     for t in trades:
+        if t.trade_type == "buy" and t.status == "pending":
+            continue
         if t.fund_code not in fund_map:
             fund_map[t.fund_code] = {"fund_name": t.fund_name, "buy_shares": 0, "sell_shares": 0, "buy_amount": 0}
         entry = fund_map[t.fund_code]
@@ -1071,6 +1523,7 @@ async def get_holdings(db: Session = Depends(get_db)):
     holdings = []
     total_value = 0
     total_cost = 0
+    latest_nav_date = None
     for code, info in fund_map.items():
         net_shares = info["buy_shares"] - info["sell_shares"]
         if net_shares <= 0.0001:
@@ -1082,6 +1535,9 @@ async def get_holdings(db: Session = Depends(get_db)):
             .first()
         )
         latest_nav = latest_nav_row.nav if latest_nav_row else 0
+        nav_date = latest_nav_row.date.isoformat() if latest_nav_row else ""
+        if latest_nav_row and (latest_nav_date is None or latest_nav_row.date > latest_nav_date):
+            latest_nav_date = latest_nav_row.date
         market_value = net_shares * latest_nav
         cost = info["buy_amount"]
         pnl = market_value - cost
@@ -1093,6 +1549,7 @@ async def get_holdings(db: Session = Depends(get_db)):
             "shares": round(net_shares, 4),
             "cost": round(cost, 2),
             "latest_nav": latest_nav,
+            "nav_date": nav_date,
             "market_value": round(market_value, 2),
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
@@ -1100,12 +1557,31 @@ async def get_holdings(db: Session = Depends(get_db)):
         total_value += market_value
         total_cost += cost
 
+    # 待确认交易列表
+    pending_list = []
+    for t in pending_buy_trades:
+        pending_list.append({
+            "fund_code": t.fund_code,
+            "fund_name": t.fund_name or "",
+            "trade_label": t.trade_label or "",
+            "amount": round(t.amount, 2),
+            "nav": t.nav,
+            "shares": round(t.shares, 4),
+            "confirm_date": t.confirm_date.isoformat() if t.confirm_date else "",
+        })
+
+    nav_date_str = latest_nav_date.isoformat() if latest_nav_date else ""
+    nav_stale = latest_nav_date < date.today() if latest_nav_date else True
+
     return {
         "balance": round(account.balance, 2),
         "holdings": holdings,
         "total_value": round(total_value, 2),
         "total_cost": round(total_cost, 2),
         "total_pnl": round(total_value - total_cost, 2),
+        "nav_date": nav_date_str,
+        "nav_stale": nav_stale,
+        "pending_trades": pending_list,
     }
 
 
@@ -1128,6 +1604,8 @@ async def get_trade_history(db: Session = Depends(get_db)):
             "nav": t.nav,
             "amount": round(t.amount, 2),
             "trade_date": t.trade_date.isoformat() if t.trade_date else "",
+            "status": t.status or "confirmed",
+            "confirm_date": t.confirm_date.isoformat() if t.confirm_date else "",
         }
         for t in trades
     ]
@@ -1140,12 +1618,15 @@ async def get_ai_trading_board(db: Session = Depends(get_db)):
     if not account:
         return {"initialized": False, "balance": 0, "total_assets": 0, "total_return_pct": 0, "holdings": [], "trades": []}
 
+    _auto_confirm_trades(db)
     initial_balance = 100000.0
     trades = db.query(VirtualTrade).order_by(VirtualTrade.trade_date.asc()).all()
 
-    # 计算持仓
+    # 计算持仓（只计已确认交易）
     fund_map: dict[str, dict] = {}
     for t in trades:
+        if t.trade_type == "buy" and t.status == "pending":
+            continue
         if t.fund_code not in fund_map:
             fund_map[t.fund_code] = {"fund_name": t.fund_name, "buy_shares": 0, "sell_shares": 0, "buy_amount": 0, "sell_amount": 0}
         entry = fund_map[t.fund_code]
@@ -1158,12 +1639,16 @@ async def get_ai_trading_board(db: Session = Depends(get_db)):
 
     holdings = []
     holdings_value = 0
+    latest_nav_date = None  # 追踪最新净值日期
     for code, info in fund_map.items():
         net_shares = info["buy_shares"] - info["sell_shares"]
         if net_shares <= 0.0001:
             continue
         latest_nav_row = db.query(FundNav).filter(FundNav.fund_code == code).order_by(FundNav.date.desc()).first()
         latest_nav = latest_nav_row.nav if latest_nav_row else 0
+        nav_date = latest_nav_row.date.isoformat() if latest_nav_row else ""
+        if latest_nav_row and (latest_nav_date is None or latest_nav_row.date > latest_nav_date):
+            latest_nav_date = latest_nav_row.date
         market_value = net_shares * latest_nav
         cost = info["buy_amount"]
         pnl = market_value - cost
@@ -1175,13 +1660,22 @@ async def get_ai_trading_board(db: Session = Depends(get_db)):
             "cost": round(cost, 2),
             "market_value": round(market_value, 2),
             "latest_nav": latest_nav,
+            "nav_date": nav_date,
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
         })
         holdings_value += market_value
 
+    # 待确认金额
+    pending_value = sum(t.amount for t in trades if t.status == "pending" and t.trade_type == "buy")
+
     total_assets = account.balance + holdings_value
     total_return_pct = ((total_assets - initial_balance) / initial_balance) * 100
+
+    # 净值时效性：判断数据是否为今天
+    today_date = date.today()
+    nav_date_str = latest_nav_date.isoformat() if latest_nav_date else ""
+    nav_stale = latest_nav_date < today_date if latest_nav_date else True
 
     # 交易记录（最近50笔）
     recent_trades = db.query(VirtualTrade).order_by(VirtualTrade.trade_date.desc()).limit(50).all()
@@ -1191,24 +1685,61 @@ async def get_ai_trading_board(db: Session = Depends(get_db)):
             "fund_code": t.fund_code,
             "fund_name": t.fund_name or "",
             "trade_type": t.trade_type,
+            "trade_label": t.trade_label or "",
             "amount": round(t.amount, 2),
             "nav": t.nav,
             "shares": round(t.shares, 4),
             "trade_date": t.trade_date.strftime("%m-%d %H:%M") if t.trade_date else "",
+            "status": t.status or "confirmed",
+            "confirm_date": t.confirm_date.isoformat() if t.confirm_date else "",
         })
 
     return {
         "initialized": True,
         "balance": round(account.balance, 2),
         "holdings_value": round(holdings_value, 2),
+        "pending_value": round(pending_value, 2),
         "total_assets": round(total_assets, 2),
         "initial_balance": initial_balance,
         "total_pnl": round(total_assets - initial_balance, 2),
         "total_return_pct": round(total_return_pct, 2),
         "trade_count": len(trades),
+        "nav_date": nav_date_str,
+        "nav_stale": nav_stale,
         "holdings": holdings,
         "trades": trade_list,
     }
+
+
+@app.post("/api/ai-trading/cancel/{trade_id}")
+async def cancel_trade(trade_id: int, db: Session = Depends(get_db)):
+    """撤销待确认的买入交易"""
+    trade = db.query(VirtualTrade).filter(VirtualTrade.id == trade_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="交易不存在")
+    if trade.status != "pending":
+        raise HTTPException(status_code=400, detail="只能撤销待确认的交易")
+    if trade.trade_type != "buy":
+        raise HTTPException(status_code=400, detail="只能撤销买入交易")
+
+    # 退还金额到账户
+    account = db.query(VirtualAccount).filter(VirtualAccount.id == 1).first()
+    if account:
+        account.balance += trade.amount
+
+    # 删除对应的 TradeRecord（pending 状态的）
+    db.query(TradeRecord).filter(
+        TradeRecord.fund_code == trade.fund_code,
+        TradeRecord.trade_type == "buy",
+        TradeRecord.status == "pending",
+        TradeRecord.amount == trade.amount,
+        TradeRecord.trade_date == trade.trade_date,
+    ).delete()
+
+    db.delete(trade)
+    db.commit()
+
+    return {"success": True, "refunded": round(trade.amount, 2), "balance": round(account.balance, 2)}
 
 
 @app.get("/api/ai-trading/suggestions")
@@ -1229,10 +1760,13 @@ async def get_trading_suggestions(db: Session = Depends(get_db)):
         if len(prices) >= 20:
             all_prices[code] = prices
 
-    # 计算当前持仓
+    # 计算当前持仓（只计已确认交易）
+    _auto_confirm_trades(db)
     trades = db.query(VirtualTrade).all()
     net_shares = {}
     for t in trades:
+        if t.trade_type == "buy" and t.status == "pending":
+            continue
         sign = 1 if t.trade_type == "buy" else -1
         net_shares[t.fund_code] = net_shares.get(t.fund_code, 0) + t.shares * sign
 
@@ -1349,6 +1883,137 @@ async def get_fund_picks(db: Session = Depends(get_db)):
 
     picks.sort(key=lambda x: x["score"], reverse=True)
     return {"picks": picks[:10]}
+
+
+@app.get("/api/ai-trading/environment")
+async def get_environment_status(db: Session = Depends(get_db)):
+    """获取当前环境感知状态"""
+    prices = [r.nav for r in db.query(FundNav.nav)
+              .filter(FundNav.fund_code == "000961")
+              .order_by(FundNav.date.asc()).all()]
+    if len(prices) < 80:
+        return {"available": False, "message": "数据不足，需要至少80个交易日"}
+
+    env = sense_environment(prices)
+    return {
+        "available": True,
+        "vol_state": env.vol_state.value,
+        "trend_state": env.trend_state.value,
+        "environment": env.environment.value,
+        "strategy": env.strategy,
+        "position_coeff": env.position_coeff,
+        "atr_20": env.atr_20,
+        "atr_60": env.atr_60,
+        "adx": env.adx,
+        "plus_di": env.plus_di,
+        "minus_di": env.minus_di,
+    }
+
+
+@app.get("/api/ai-trading/risk-status")
+async def get_risk_status(db: Session = Depends(get_db)):
+    """获取当前风控状态"""
+    from services.risk_manager import get_risk_summary
+    summary = get_risk_summary(db, date.today())
+    return summary
+
+
+@app.get("/api/ai-trading/r-distribution")
+async def get_r_distribution(db: Session = Depends(get_db)):
+    """获取 R 乘数分布分析"""
+    trades = db.query(TradeRecord.r_multiple).filter(
+        TradeRecord.r_multiple.isnot(None)
+    ).order_by(TradeRecord.trade_date.desc()).limit(100).all()
+    r_values = [t.r_multiple for t in trades if t.r_multiple is not None]
+    return analyze_r_distribution(r_values)
+
+
+@app.get("/api/ai-trading/dual-cycle")
+async def get_dual_cycle(db: Session = Depends(get_db)):
+    """获取双周期状态矩阵"""
+    prices = [r.nav for r in db.query(FundNav.nav)
+              .filter(FundNav.fund_code == "000961")
+              .order_by(FundNav.date.asc()).all()]
+    if len(prices) < 80:
+        return {"available": False}
+    result = analyze_dual_cycle(prices)
+    return {
+        "available": True,
+        "long_cycle": result.long_cycle.value,
+        "short_cycle": result.short_cycle.value,
+        "long_ema": result.long_ema,
+        "short_ema": result.short_ema,
+        "adx": result.adx,
+        "rsi": result.rsi,
+        "allowed_strategy": result.allowed_strategy,
+        "cell_expectation": result.cell_expectation,
+    }
+
+
+@app.get("/api/ai-trading/equity-curve")
+async def get_equity_curve(db: Session = Depends(get_db)):
+    """获取净值曲线数据（策略 vs 基准）"""
+    from models import DailySnapshot
+    snaps = db.query(DailySnapshot).order_by(DailySnapshot.snapshot_date.asc()).all()
+    if not snaps:
+        return {"available": False, "data": []}
+    return {
+        "available": True,
+        "data": [
+            {
+                "date": s.snapshot_date.isoformat(),
+                "total_assets": s.total_assets,
+                "daily_return": s.daily_return,
+                "cumulative_return": s.cumulative_return,
+                "max_drawdown": s.max_drawdown,
+                "benchmark_return": s.benchmark_return,
+                "benchmark_cumulative": s.benchmark_cumulative,
+                "holdings_count": s.holdings_count,
+            }
+            for s in snaps
+        ],
+    }
+
+
+# ==================== 红队测试 & 执行层熔断 API ====================
+
+@app.post("/api/evolution/candidates/{candidate_id}/evaluate")
+async def evaluate_strategy(candidate_id: int):
+    """完整评估：过拟合检测 + 红队压力测试"""
+    from services.evolution import run_full_evaluation
+    result = run_full_evaluation(candidate_id)
+    return result
+
+
+@app.post("/api/evolution/candidates/{candidate_id}/stress-test")
+async def stress_test_strategy(candidate_id: int):
+    """红队压力测试"""
+    from services.evolution import red_team_stress_test
+    return red_team_stress_test(candidate_id)
+
+
+@app.post("/api/evolution/candidates/{candidate_id}/overfit-check")
+async def check_overfit(candidate_id: int):
+    """过拟合检测"""
+    from services.evolution import overfit_detection
+    return overfit_detection(candidate_id)
+
+
+@app.get("/api/evolution/circuit-breaker")
+async def get_circuit_breaker():
+    """执行层行为熔断状态"""
+    from services.evolution import check_execution_circuit_breaker
+    return check_execution_circuit_breaker()
+
+
+@app.get("/api/evolution/stress-scenarios")
+async def get_stress_scenarios():
+    """获取红队测试场景列表"""
+    from services.evolution import STRESS_SCENARIOS
+    return [
+        {"id": k, "name": v["name"], "description": v["description"]}
+        for k, v in STRESS_SCENARIOS.items()
+    ]
 
 
 # ============ 关注列表 & 推送配置 ============
@@ -1499,21 +2164,105 @@ async def trigger_ai_analysis():
 
 
 @app.get("/api/admin/backtest")
-async def run_backtest_api(start: str = "2025-01-01", end: str = "2026-05-25"):
-    """执行策略回测。参数：start=开始日期, end=结束日期"""
-    from services.backtest import run_backtest as do_backtest
+async def run_backtest_api(start: str = "2025-01-01", end: str = "2026-05-25", version: str = "v5"):
+    """执行策略回测。参数：start=开始日期, end=结束日期, version=v5|v6|fused|compare"""
     from datetime import date as dt_date
     try:
         s = dt_date.fromisoformat(start)
         e = dt_date.fromisoformat(end)
         db = next(get_db())
         try:
-            result = do_backtest(db, s, e)
+            if version == "compare":
+                from services.backtest import run_backtest as do_v5, run_backtest_fused
+                r5 = do_v5(db, s, e)
+                rf = run_backtest_fused(db, s, e)
+                return {
+                    "v5": {k: r5[k] for k in ["total_return", "annualized_return", "max_drawdown",
+                                                "sharpe_ratio", "win_rate", "total_trades", "avg_equity_ratio"]},
+                    "fused": {k: rf[k] for k in ["total_return", "annualized_return", "max_drawdown",
+                                                  "sharpe_ratio", "win_rate", "total_trades", "avg_equity_ratio",
+                                                  "r_distribution", "env_distribution"]},
+                }
+            elif version == "fused":
+                from services.backtest import run_backtest_fused
+                result = run_backtest_fused(db, s, e)
+            elif version == "v6":
+                from services.backtest import run_backtest_v6
+                result = run_backtest_v6(db, s, e)
+            else:
+                from services.backtest import run_backtest as do_backtest
+                result = do_backtest(db, s, e)
             return result
         finally:
             db.close()
     except Exception as e:
         return {"error": str(e)}
+
+
+# ==================== 策略进化系统 API ====================
+
+@app.get("/api/evolution/candidates")
+async def get_strategy_candidates(status: str = None, limit: int = 20):
+    """获取候选策略列表"""
+    from services.evolution import list_candidates
+    return list_candidates(status=status, limit=limit)
+
+
+@app.post("/api/evolution/candidates/{candidate_id}/approve")
+async def approve_strategy(candidate_id: int, notes: str = "", trial_days: int = 14):
+    """审核通过候选策略"""
+    from services.evolution import approve_candidate
+    try:
+        c = approve_candidate(candidate_id, notes=notes, trial_days=trial_days)
+        return {"status": "approved", "id": c.id, "trial_end": c.trial_end.isoformat()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/evolution/candidates/{candidate_id}/reject")
+async def reject_strategy(candidate_id: int, notes: str = ""):
+    """拒绝候选策略"""
+    from services.evolution import reject_candidate
+    try:
+        c = reject_candidate(candidate_id, notes=notes)
+        return {"status": "rejected", "id": c.id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/evolution/anomalies")
+async def get_anomalies(resolved: int = 0, limit: int = 20):
+    """获取行为异常告警"""
+    from services.evolution import get_anomaly_alerts
+    return get_anomaly_alerts(resolved=resolved, limit=limit)
+
+
+@app.post("/api/evolution/anomalies/{alert_id}/resolve")
+async def resolve_anomaly(alert_id: int, db: Session = Depends(get_db)):
+    """标记异常已处理"""
+    from models import AnomalyAlert
+    alert = db.query(AnomalyAlert).filter(AnomalyAlert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="告警不存在")
+    alert.resolved = 1
+    db.commit()
+    return {"status": "resolved", "id": alert_id}
+
+
+@app.post("/api/evolution/update-fingerprints")
+async def update_fingerprints():
+    """更新行为指纹"""
+    from services.evolution import update_behavior_fingerprints
+    update_behavior_fingerprints()
+    return {"status": "updated"}
+
+
+@app.post("/api/evolution/detect-anomalies")
+async def run_anomaly_detection():
+    """运行异常检测"""
+    from services.evolution import detect_anomalies
+    anomalies = detect_anomalies()
+    return {"anomalies": anomalies, "count": len(anomalies)}
 
 
 # Serve frontend static files

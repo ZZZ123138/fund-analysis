@@ -39,3 +39,21 @@ package-lock.json
 
 # Logs
 *.log
+
+# Runtime artifacts
+backend/.heartbeat
+backend/=*
+
+# Build artifacts
+frontend/tsconfig.tsbuildinfo
+
+# Local scripts
+*.bat
+*.ps1
+*.vbs
+gp.sh
+
+# Standalone demos
+css/
+js/
+dashboard-demo.html

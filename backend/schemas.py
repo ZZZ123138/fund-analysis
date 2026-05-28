@@ -88,3 +88,29 @@ class NotificationSettings(BaseModel):
     serverchan_key: Optional[str] = None
     enabled: Optional[int] = None
     check_interval_minutes: Optional[int] = None
+
+
+class EnvironmentStatus(BaseModel):
+    available: bool
+    vol_state: Optional[str] = None
+    trend_state: Optional[str] = None
+    environment: Optional[str] = None
+    strategy: Optional[str] = None
+    position_coeff: Optional[float] = None
+    atr_20: Optional[float] = None
+    atr_60: Optional[float] = None
+    adx: Optional[float] = None
+    plus_di: Optional[float] = None
+    minus_di: Optional[float] = None
+    message: Optional[str] = None
+
+
+class RiskStatus(BaseModel):
+    has_state: bool
+    daily_pnl: Optional[float] = None
+    daily_pnl_pct: Optional[float] = None
+    weekly_drawdown: Optional[float] = None
+    total_drawdown: Optional[float] = None
+    consecutive_losses: Optional[int] = None
+    strategy_status: Optional[str] = None
+    circuit_breaker: Optional[dict] = None

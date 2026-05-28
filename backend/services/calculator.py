@@ -446,3 +446,122 @@ def infer_fund_type(fund_name: str) -> dict:
         "description": description,
         "characteristics": characteristics,
     }
+
+
+# ============ 技术指标：ATR / ADX / EMA / Bollinger Bands ============
+
+def calculate_atr(prices: list[float], period: int = 20) -> float:
+    """ATR（平均真实波幅），Wilder 平滑法。
+    因基金净值仅有收盘价，TR 代理为 |close[i] - close[i-1]|。
+    返回绝对值（与价格同单位）。
+    """
+    if len(prices) < period + 1:
+        return 0.0
+    tr_list = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+    atr = sum(tr_list[:period]) / period
+    for i in range(period, len(tr_list)):
+        atr = (atr * (period - 1) + tr_list[i]) / period
+    return atr
+
+
+def calculate_adx(prices: list[float], period: int = 14) -> dict:
+    """ADX（平均趋向指标），使用收盘价代理。
+    返回 {"adx": float, "plus_di": float, "minus_di": float}。
+    """
+    if len(prices) < period * 2 + 1:
+        return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+
+    # 计算 +DM / -DM / TR
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i - 1]
+        plus_dm.append(max(change, 0))
+        minus_dm.append(max(-change, 0))
+        tr_list.append(abs(prices[i] - prices[i - 1]))
+
+    # Wilder 平滑
+    sm_plus = sum(plus_dm[:period])
+    sm_minus = sum(minus_dm[:period])
+    sm_tr = sum(tr_list[:period])
+
+    dx_list = []
+    for i in range(period, len(plus_dm)):
+        sm_plus = sm_plus - sm_plus / period + plus_dm[i]
+        sm_minus = sm_minus - sm_minus / period + minus_dm[i]
+        sm_tr = sm_tr - sm_tr / period + tr_list[i]
+
+        if sm_tr == 0:
+            continue
+        plus_di = sm_plus / sm_tr * 100
+        minus_di = sm_minus / sm_tr * 100
+        di_sum = plus_di + minus_di
+        dx = abs(plus_di - minus_di) / di_sum * 100 if di_sum > 0 else 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+
+    # ADX = DX 的 Wilder 平滑
+    adx = sum(dx_list[:period]) / period
+    for i in range(period, len(dx_list)):
+        adx = (adx * (period - 1) + dx_list[i]) / period
+
+    # 最终 DI 值
+    if sm_tr == 0:
+        return {"adx": round(adx, 2), "plus_di": 0.0, "minus_di": 0.0}
+    plus_di = sm_plus / sm_tr * 100
+    minus_di = sm_minus / sm_tr * 100
+
+    return {"adx": round(adx, 2), "plus_di": round(plus_di, 2), "minus_di": round(minus_di, 2)}
+
+
+def calculate_ema(prices: list[float], period: int) -> list[float]:
+    """EMA（指数移动平均）序列。SMA 种子启动，乘数 = 2/(period+1)。"""
+    if len(prices) < period:
+        return prices[:]
+    multiplier = 2.0 / (period + 1)
+    ema = [0.0] * len(prices)
+    ema[period - 1] = sum(prices[:period]) / period
+    for i in range(period, len(prices)):
+        ema[i] = (prices[i] - ema[i - 1]) * multiplier + ema[i - 1]
+    return ema
+
+
+def calculate_bollinger_bands(prices: list[float], period: int = 20, num_std: float = 2.0) -> dict:
+    """布林带。返回 {upper, middle, lower, bandwidth, pct_b}。
+    bandwidth = (upper - lower) / middle（归一化带宽）
+    pct_b = (close - lower) / (upper - lower)（价格在带内位置）
+    """
+    if len(prices) < period:
+        return {"upper": 0.0, "middle": 0.0, "lower": 0.0, "bandwidth": 0.0, "pct_b": 0.5}
+    window = prices[-period:]
+    middle = sum(window) / period
+    std = _std_sample(window)
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    bandwidth = (upper - lower) / middle if middle > 0 else 0
+    pct_b = (prices[-1] - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+    return {
+        "upper": round(upper, 4),
+        "middle": round(middle, 4),
+        "lower": round(lower, 4),
+        "bandwidth": round(bandwidth, 4),
+        "pct_b": round(pct_b, 4),
+    }
+
+
+def calculate_high_low_range(prices: list[float], period: int = 20) -> dict:
+    """N 日最高/最低价区间。用于震荡策略入场/离场边界。"""
+    if len(prices) < period:
+        period = len(prices)
+    window = prices[-period:]
+    high = max(window)
+    low = min(window)
+    midpoint = (high + low) / 2
+    range_pct = (high - low) / low * 100 if low > 0 else 0
+    return {
+        "high": high,
+        "low": low,
+        "midpoint": round(midpoint, 4),
+        "range_pct": round(range_pct, 2),
+    }

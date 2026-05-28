@@ -13,12 +13,22 @@ interface Holding {
   pnl_pct: number;
 }
 
+interface PendingTrade {
+  fund_code: string;
+  fund_name: string;
+  amount: number;
+  nav: number;
+  shares: number;
+  confirm_date: string;
+}
+
 interface PortfolioData {
   balance: number;
   holdings: Holding[];
   total_value: number;
   total_cost: number;
   total_pnl: number;
+  pending_trades: PendingTrade[];
 }
 
 interface TradeRecord {
@@ -30,6 +40,8 @@ interface TradeRecord {
   nav: number;
   amount: number;
   trade_date: string;
+  status: string;
+  confirm_date: string;
 }
 
 export default function PortfolioView() {
@@ -95,7 +107,8 @@ export default function PortfolioView() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "买入失败");
-      setMsg(`买入成功：${data.fund_name || data.fund_code}，获得 ${data.shares} 份`);
+      const confirmInfo = data.confirm_date ? `，${data.confirm_date} 确认份额` : "";
+      setMsg(`买入成功：${data.fund_name || data.fund_code}，获得 ${data.shares} 份${confirmInfo}`);
       setBuyCode("");
       await loadPortfolio();
     } catch (e: any) {
@@ -293,6 +306,36 @@ export default function PortfolioView() {
         </div>
       )}
 
+      {/* 待确认交易 */}
+      {portfolio && portfolio.pending_trades && portfolio.pending_trades.length > 0 && (
+        <div className="portfolio-holdings" style={{ marginTop: 12 }}>
+          <h3 style={{ marginBottom: 12, color: "var(--orange, #f59e0b)", fontSize: 15 }}>
+            待确认（T+1）
+          </h3>
+          <div className="holdings-list">
+            {portfolio.pending_trades.map((t) => (
+              <div className="holding-row" key={t.fund_code} style={{ opacity: 0.7 }}>
+                <div className="holding-info">
+                  <div className="holding-name">{t.fund_name || t.fund_code}</div>
+                  <div className="holding-code">{t.fund_code}</div>
+                </div>
+                <div className="holding-stats">
+                  <div><span className="stat-label">申购金额</span> {t.amount.toLocaleString("zh-CN", { minimumFractionDigits: 2 })} 元</div>
+                  <div><span className="stat-label">成交净值</span> {t.nav.toFixed(4)}</div>
+                  <div><span className="stat-label">预计份额</span> {t.shares.toFixed(4)} 份</div>
+                  <div style={{ color: "var(--orange, #f59e0b)" }}>
+                    <span className="stat-label">确认日</span> {t.confirm_date}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 6 }}>
+            份额确认前不计收益，确认后自动生效
+          </div>
+        </div>
+      )}
+
       {/* 交易记录 */}
       <div style={{ marginTop: 16 }}>
         <button
@@ -322,11 +365,12 @@ export default function PortfolioView() {
                 <th>净值</th>
                 <th>份额</th>
                 <th>金额</th>
+                <th>状态</th>
               </tr>
             </thead>
             <tbody>
               {history.map((t) => (
-                <tr key={t.id}>
+                <tr key={t.id} style={t.status === "pending" ? { opacity: 0.6 } : undefined}>
                   <td>{t.trade_date ? new Date(t.trade_date).toLocaleString("zh-CN") : "-"}</td>
                   <td className={t.trade_type === "buy" ? "positive" : "negative"}>
                     {t.trade_type === "buy" ? "买入" : "卖出"}
@@ -335,6 +379,13 @@ export default function PortfolioView() {
                   <td>{t.nav.toFixed(4)}</td>
                   <td>{t.shares.toFixed(4)}</td>
                   <td>{fmt(t.amount)}</td>
+                  <td>
+                    {t.status === "pending" ? (
+                      <span style={{ color: "var(--orange, #f59e0b)", fontSize: 12 }}>待确认</span>
+                    ) : (
+                      <span style={{ color: "var(--text-tertiary)", fontSize: 12 }}>已确认</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

@@ -1,13 +1,11 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, lazy, Suspense } from "react";
 import gsap from "gsap";
 import FundSearch from "@/components/FundSearch";
 import MetricsCard from "@/components/MetricsCard";
 import FundChart from "@/components/FundChart";
 import FundInfo from "@/components/FundInfo";
-import CompareView from "@/components/CompareView";
-import StrategyView from "@/components/StrategyView";
 import ReturnDistribution from "@/components/ReturnDistribution";
 import RiskHeatmap from "@/components/RiskHeatmap";
 import AIFundPicks from "@/components/AIFundPicks";
@@ -15,8 +13,12 @@ import AIAutoTrader from "@/components/AIAutoTrader";
 import CycleIndicator from "@/components/CycleIndicator";
 import MacroClockView from "@/components/MacroClockView";
 import UnderlyingAnalysis from "@/components/UnderlyingAnalysis";
-import MarketMonitor from "@/components/MarketMonitor";
-import AITradingBoard from "@/components/AITradingBoard";
+
+// 懒加载非首屏组件（减少初始 bundle 大小）
+const CompareView = lazy(() => import("@/components/CompareView"));
+const StrategyView = lazy(() => import("@/components/StrategyView"));
+const MarketMonitor = lazy(() => import("@/components/MarketMonitor"));
+const AITradingBoard = lazy(() => import("@/components/AITradingBoard"));
 
 interface Metrics {
   fund_code: string;
@@ -498,7 +500,9 @@ export default function Home() {
         {activeTab === "compare" && !loading && (
           <div className="card">
             <h2>多基金对比</h2>
-            <CompareView />
+            <Suspense fallback={<div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary)" }}>加载中...</div>}>
+              <CompareView />
+            </Suspense>
           </div>
         )}
 
@@ -508,7 +512,9 @@ export default function Home() {
             {navHistory.length > 0 && fundCode && (
               <div className="card">
                 <h2>动量×波动率策略</h2>
-                <StrategyView navHistory={navHistory} fundCode={fundCode} />
+                <Suspense fallback={<div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary)" }}>加载中...</div>}>
+                  <StrategyView navHistory={navHistory} fundCode={fundCode} />
+                </Suspense>
               </div>
             )}
             {!fundCode && (
@@ -524,11 +530,15 @@ export default function Home() {
           <>
             <div className="card">
               <h2>AI 交易看板</h2>
-              <AITradingBoard />
+              <Suspense fallback={<div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary)" }}>加载中...</div>}>
+                <AITradingBoard />
+              </Suspense>
             </div>
             <div className="card">
               <h2>推送配置</h2>
-              <MarketMonitor />
+              <Suspense fallback={<div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary)" }}>加载中...</div>}>
+                <MarketMonitor />
+              </Suspense>
             </div>
           </>
         )}
